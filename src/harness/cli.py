@@ -8,6 +8,7 @@ called and the repository is not modified.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Mapping, Optional, TextIO
 
 from harness import __version__
-from harness.config import Config, ConfigError, load_config
+from harness.config import API_KEY_VAR, Config, ConfigError, load_config, load_context_limits
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -53,6 +54,21 @@ def build_parser() -> argparse.ArgumentParser:
     task = run.add_mutually_exclusive_group()
     task.add_argument("--task", metavar="TEXT", help="task description or GitHub issue text")
     task.add_argument("--task-file", metavar="FILE", help="file containing the task description")
+
+    inspect = subcommands.add_parser(
+        "inspect",
+        help="profile a repository and, given a task, rank relevant files (no model, no API key)",
+        description="Show the repository profile. With --task or --task-file, also show task signals, "
+                    "ranked candidate files with reasons, and discovery metrics. Makes no model call "
+                    "and does not modify the repository.",
+    )
+    inspect.add_argument("--repo", metavar="PATH", required=True, help="path to the repository")
+    inspect_task = inspect.add_mutually_exclusive_group()
+    inspect_task.add_argument("--task", metavar="TEXT", help="task description")
+    inspect_task.add_argument("--task-file", metavar="FILE", help="file containing the task description")
+    inspect.add_argument("--top", metavar="N", type=int, default=10, help="candidates to show (default 10)")
+    inspect.add_argument("--show-context", action="store_true",
+                         help="also print the rendered working set a planner would receive")
     return parser
 
 
@@ -74,6 +90,8 @@ def main(
     if args.command is None:
         parser.print_help(stderr)
         return EXIT_USAGE
+    if args.command == "inspect":
+        return _inspect(args, environ=environ, dotenv_path=dotenv_path, stdout=stdout, stderr=stderr)
 
     try:
         config = load_config(environ=environ, dotenv_path=dotenv_path)
@@ -91,6 +109,45 @@ def main(
         return EXIT_INTERRUPTED
 
     stdout.write(config.redact(_report(config, task_input)))
+    stdout.flush()
+    return EXIT_OK
+
+
+def _inspect(args: argparse.Namespace, *, environ: Optional[Mapping[str, str]], dotenv_path: Optional[Path],
+             stdout: TextIO, stderr: TextIO) -> int:
+    """Repository intelligence only. Deliberately does not load the API key."""
+    from harness.repo.discovery import discover_for_task
+    from harness.repo.profile import analyze_repository
+    from harness.repo.report import format_discovery, format_profile
+
+    secret = (os.environ if environ is None else environ).get(API_KEY_VAR, "")
+
+    def redact(text: str) -> str:
+        return text.replace(secret, "***") if secret else text
+
+    try:
+        repo = _validate_repo(args.repo)
+        limits = load_context_limits(environ=environ, dotenv_path=dotenv_path)
+        task = None
+        if args.task is not None:
+            task = args.task
+        elif args.task_file is not None:
+            task = _read_task_file(args.task_file)
+        if task is not None and not task.strip():
+            raise InputError("task must not be empty")
+        if args.top < 1:
+            raise InputError("--top must be at least 1")
+    except (InputError, ConfigError) as exc:
+        print(redact(f"error: {exc}"), file=stderr)
+        return EXIT_USAGE
+
+    if task is None:
+        stdout.write(redact(format_profile(analyze_repository(repo))))
+    else:
+        result = discover_for_task(repo, task, limits=limits)
+        stdout.write(redact(format_discovery(result, top=args.top)))
+        if args.show_context:
+            stdout.write(redact("\n--- working set ---\n" + result.working_set.render()))
     stdout.flush()
     return EXIT_OK
 

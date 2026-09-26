@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 # ---------------------------------------------------------------------------
 # ORGANIZER-PRESCRIBED MODEL
@@ -35,6 +35,15 @@ MAX_STEPS_VAR = "HARNESS_MAX_STEPS"
 MAX_REPAIR_CYCLES_VAR = "HARNESS_MAX_REPAIR_CYCLES"
 COMMAND_TIMEOUT_VAR = "HARNESS_COMMAND_TIMEOUT_SECONDS"
 
+# Working-context limits for repository discovery (see ContextLimits).
+CONTEXT_LIMIT_VARS = {
+    "max_active_files": "HARNESS_MAX_ACTIVE_FILES",
+    "max_candidates": "HARNESS_MAX_CANDIDATES",
+    "max_evidence_items": "HARNESS_MAX_EVIDENCE_ITEMS",
+    "max_snippet_lines": "HARNESS_MAX_SNIPPET_LINES",
+    "max_context_chars": "HARNESS_MAX_CONTEXT_CHARS",
+}
+
 REDACTED = "***"
 
 
@@ -57,11 +66,23 @@ class Limits:
 
 
 @dataclass(frozen=True)
+class ContextLimits:
+    """Bounds for the working set a planner receives (repository discovery)."""
+
+    max_active_files: int = 8        # files whose evidence may enter the working set
+    max_candidates: int = 25         # ranked candidates listed in the working set
+    max_evidence_items: int = 24     # snippets in the working set
+    max_snippet_lines: int = 30      # lines per snippet
+    max_context_chars: int = 24_000  # rendered working set, hard ceiling
+
+
+@dataclass(frozen=True)
 class Config:
     api_key: str = field(repr=False)
     model: ModelSettings
     limits: Limits
     env_file: Optional[Path] = None
+    context: ContextLimits = field(default_factory=ContextLimits)
 
     def redact(self, text: str) -> str:
         """Replace every occurrence of the API key in ``text``."""
@@ -94,11 +115,10 @@ def parse_dotenv(text: str) -> dict[str, str]:
     return values
 
 
-def load_config(
-    environ: Optional[Mapping[str, str]] = None,
-    dotenv_path: Optional[Path] = None,
-) -> Config:
-    """Build a validated ``Config``. Raises ``ConfigError`` with a usable message."""
+def _settings(
+    environ: Optional[Mapping[str, str]], dotenv_path: Optional[Path]
+) -> tuple[Callable[[str], Optional[str]], Optional[Path]]:
+    """Return a lookup (environment first, then ``.env``) and the ``.env`` path used."""
     env = os.environ if environ is None else environ
     if dotenv_path is None:
         dotenv_path = Path.cwd() / ".env"
@@ -118,6 +138,33 @@ def load_config(
             if value:
                 return value
         return None
+
+    return get, env_file
+
+
+def load_context_limits(
+    environ: Optional[Mapping[str, str]] = None,
+    dotenv_path: Optional[Path] = None,
+) -> ContextLimits:
+    """Context limits only. Needs no API key (used by ``harness inspect``)."""
+    get, _ = _settings(environ, dotenv_path)
+    return _context_limits(get)
+
+
+def _context_limits(get: Callable[[str], Optional[str]]) -> ContextLimits:
+    defaults = ContextLimits()
+    return ContextLimits(**{
+        name: _positive_int(var, get(var), getattr(defaults, name))
+        for name, var in CONTEXT_LIMIT_VARS.items()
+    })
+
+
+def load_config(
+    environ: Optional[Mapping[str, str]] = None,
+    dotenv_path: Optional[Path] = None,
+) -> Config:
+    """Build a validated ``Config``. Raises ``ConfigError`` with a usable message."""
+    get, env_file = _settings(environ, dotenv_path)
 
     api_key = get(API_KEY_VAR)
     if api_key is None:
@@ -149,6 +196,7 @@ def load_config(
             ),
         ),
         env_file=env_file,
+        context=_context_limits(get),
     )
 
 
