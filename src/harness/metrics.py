@@ -2,8 +2,10 @@
 
 Counting rules:
 
-- ``model_calls``: one per ``generate()`` attempt made through
-  ``MeteredModelClient``, including attempts that raise.
+- ``model_calls``: one per logical ``generate()`` call made through
+  ``MeteredModelClient``, including calls that raise.
+- ``provider_attempts``: transport attempts behind those calls, including an
+  adapter's own retries of transient failures (``>= model_calls``).
 - ``tool_calls``: one per ``ToolRegistry.dispatch()``, including calls that fail
   validation, are blocked, or error.
 - ``command_calls``: one per caller-supplied command actually launched by the
@@ -25,6 +27,7 @@ class ExecutionMetrics:
     input_tokens: int = 0
     output_tokens: int = 0
     model_calls_without_usage: int = 0
+    provider_attempts: int = 0
     tool_calls: int = 0
     tool_failures: int = 0
     tool_calls_by_name: dict[str, int] = field(default_factory=dict)
@@ -36,8 +39,10 @@ class ExecutionMetrics:
         failed: bool = False,
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
+        attempts: int = 1,
     ) -> None:
         self.model_calls += 1
+        self.provider_attempts += max(attempts, 1)
         if failed:
             self.model_failures += 1
             return

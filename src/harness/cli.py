@@ -327,6 +327,7 @@ def _report(config: Config, task_input: TaskInput) -> str:
     rows = [
         "Configuration accepted.",
         f"  API key:         set (redacted)",
+        f"  Model adapter:   {model.adapter or NOT_SET}",
         f"  Model provider:  {model.provider or NOT_SET}",
         f"  Model:           {model.name or NOT_SET}",
         f"  Base URL:        {model.base_url or NOT_SET}",

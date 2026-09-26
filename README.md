@@ -7,9 +7,10 @@ Architecture: [arch.md](arch.md). Status: [PROGRESS.md](PROGRESS.md).
 > first, then the discovered suite, before any edit) → one-action-per-step execution with
 > deterministic context compaction → evidence-based verification → bounded repair with a
 > repeated-failure stop rule → VERIFIED only on strong evidence. Every run writes artifacts
-> (`harness runs`, `harness report <id>`). It is exercised end to end with a scripted model;
-> no live model adapter exists yet (the provider has not been announced), so `make run`
-> accepts input and then stops with a precise "provider not supported" message.
+> (`harness runs`, `harness report <id>`). Models are reached through the provider-neutral
+> `openai_compatible` adapter (stdlib HTTP, no SDK); it has been run live against Qwen3 and
+> DeepSeek V3.x models on AWS Bedrock (see "Model configuration"). Without model settings,
+> `make run` accepts input and then stops with a precise "no model configured" message.
 
 ## Requirements
 
@@ -27,9 +28,9 @@ make run
 ```
 
 `make run` prompts for the repository path and the task (end the task with an
-empty line). It then needs a model adapter for `AI_MODEL_PROVIDER`; this build
-has none, so it exits with code 2 and says so. Nothing is modified. You can also
-pass the input directly:
+empty line). It needs `AI_MODEL_ADAPTER`, `AI_MODEL` and `AI_BASE_URL` (see "Model
+configuration"); without them it exits with code 2, says what is missing and
+modifies nothing. You can also pass the input directly:
 
 ```sh
 make run ARGS='--repo /path/to/repo --task "Fix the failing date parser test"'
@@ -65,6 +66,25 @@ PYTHONPATH=src .venv/bin/python -m harness runs
 PYTHONPATH=src .venv/bin/python -m harness report <run-id> [--json]
 ```
 
+## Model configuration
+
+The core depends only on a provider-neutral `ModelClient`. `AI_MODEL_ADAPTER` picks the
+transport (today `openai_compatible`: any OpenAI-compatible chat-completions endpoint);
+`AI_MODEL` and `AI_BASE_URL` say which model and where. The model family never selects code.
+
+Verified live on 2026-09-26 with an AWS Bedrock API key (region us-east-1):
+
+```sh
+export AI_API_KEY="bedrock-api-key-..."       # short-term Bedrock keys expire after <= 12 h
+export AI_MODEL_ADAPTER=openai_compatible
+export AI_BASE_URL=https://bedrock-mantle.us-east-1.api.aws/v1
+export AI_MODEL=qwen.qwen3-coder-480b-a35b-instruct   # or deepseek.v3.2, deepseek.v3.1,
+                                                      # qwen.qwen3-235b-a22b-2507, qwen.qwen3-coder-next, ...
+make run ARGS='--repo /path/to/repo --task "..."'
+```
+
+The evaluator's own endpoint and model ids are not built in; set these variables for it.
+
 ## Configuration
 
 Set in the environment, or in a `.env` file in the directory you run from
@@ -73,9 +93,14 @@ Set in the environment, or in a `.env` file in the directory you run from
 | Variable | Required | Default |
 |---|---|---|
 | `AI_API_KEY` | yes | — |
-| `AI_MODEL_PROVIDER` | no | unset until organizers announce it |
-| `AI_MODEL` | no | unset until organizers announce it |
-| `AI_BASE_URL` | no | unset until organizers announce it |
+| `AI_MODEL_ADAPTER` | for `run` | unset (built in: `openai_compatible`) |
+| `AI_MODEL_PROVIDER` | no | unset; family label for reports only (e.g. `qwen`, `deepseek`) |
+| `AI_MODEL` | for `run` | unset; the model id the endpoint expects |
+| `AI_BASE_URL` | for `run` | unset; endpoint root, `/chat/completions` is appended |
+| `AI_MODEL_TIMEOUT_SECONDS` | no | 120 |
+| `AI_MODEL_MAX_RETRIES` | no | 2 (transient transport failures only) |
+| `AI_MODEL_HEADERS` | no | none (JSON object of extra headers; never `Authorization`) |
+| `AI_MODEL_STRUCTURED_OUTPUT` | no | `none` (`json_object` requests JSON mode for the plan) |
 | `HARNESS_MAX_STEPS` | no | 40 |
 | `HARNESS_MAX_REPAIR_CYCLES` | no | 3 (0 = verify, never repair) |
 | `HARNESS_MAX_REPEATED_FAILURE_CYCLES` | no | 2 |

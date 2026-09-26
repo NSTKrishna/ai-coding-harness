@@ -99,7 +99,7 @@ class Observation:
 @dataclass(frozen=True)
 class ActionRecord:
     step: int
-    kind: str                        # "tool", "complete" or "blocked"
+    kind: str                        # "tool", "complete", "blocked" or "invalid" (a reply that was not an action)
     tool: Optional[str] = None
     arguments_summary: str = ""
     source: str = ""                 # "native" or "text" for tool actions
@@ -178,7 +178,9 @@ class RunState:
         if self.baseline is not None:
             parts.append(self.baseline.render())
         if self.phase == Phase.REPAIRING and self.repair_context is not None:
-            parts.append(self.repair_context.render())
+            current = (tuple((r.path, r.current_sha256) for r in self.changes.records)
+                       if self.changes is not None else None)
+            parts.append(self.repair_context.render(current))
         return "\n\n".join(parts)
 
     # mutation ------------------------------------------------------------------

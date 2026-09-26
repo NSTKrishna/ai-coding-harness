@@ -1,6 +1,6 @@
 # Implementation Progress
 
-Last updated: 2026-09-26 (M6 complete and verified; not committed). **M6 was the final feature milestone.**
+Last updated: 2026-09-26 (M6 + DeepSeek/Qwen adapter + AUDIT.md fixes + live Bedrock evaluation; not committed).
 
 ## Current state
 
@@ -37,7 +37,7 @@ Last updated: 2026-09-26 (M6 complete and verified; not committed). **M6 was the
 
 | Req | Status |
 |---|---|
-| R1 | Accept, inspect, determine files, verify: **VERIFIED**. Understand task, modify implementation: **PARTIAL** (only scripted model output; no live model) |
+| R1 | **VERIFIED** (live: 21/24 tasks VERIFIED across 8 Qwen/DeepSeek models on Bedrock, independently re-checked) |
 | R2 Repository navigation | **VERIFIED** (all items) |
 | R3 Orchestration | **VERIFIED** (all items) |
 | R4 Context management | **VERIFIED** (all items; compaction added in M6) |
@@ -50,18 +50,38 @@ Last updated: 2026-09-26 (M6 complete and verified; not committed). **M6 was the
 | R11 Model | provider abstraction **VERIFIED**; text-only, configurable **PARTIAL** (provider not announced) |
 | R12 Reproducibility | dependencies **VERIFIED**; clean-environment and docs **PARTIAL** (macOS only; not the evaluator environment) |
 
+## Live model evaluation — 2026-09-26 (post-M6: adapter + audit fixes)
+
+Endpoint: AWS Bedrock OpenAI-compatible (`bedrock-mantle.us-east-1.api.aws/v1`) with a short-term Bedrock
+API key; `AI_MODEL_ADAPTER=openai_compatible`. 8 models x 3 tasks through `harness run` (CLI, real HTTP):
+A one-line bug, B two pricing bugs (discount + rounding, 2 of 3 tests failing), C feature addition
+(missing function imported by the tests). Each result was re-checked outside the harness (tests re-run,
+`git status` of `tests/`).
+
+| Round | Harness state | VERIFIED |
+|---|---|---|
+| baseline | adapter only | 6/24 (DeepSeek V3.2 3/3; most Qwen 0/3: protocol mismatches) |
+| 2 | + native complete/blocked, tolerant action shapes, JSON-in-prose, text-markup tool calls, bounded invalid-reply feedback, `edit_file`/`write_file` | 18/24 |
+| 3 | + one corrective re-plan, repeat/test-passed/low-budget hints, `python`->`python3`, quoted commands | **21/24** |
+
+Round 3 per model: qwen3-coder-480b, qwen3-235b-2507, qwen3-coder-next, qwen3-next-80b, qwen3-32b,
+deepseek.v3.2: 3/3 each; deepseek.v3.1 2/3 (B: no edit, stopped by the no-progress rule);
+qwen3-coder-30b 1/3 (B: step budget; C: raw newline in text JSON, fixed afterwards and re-run VERIFIED 2/2).
+Every VERIFIED result also passes independently; every failure also fails independently (no false
+success); no run modified, deleted or added a test file; 618 artifact files scanned: no key or key fragment.
+
 ## What still prevents real evaluator execution
 
-1. **No live model adapter.** `model/factory.ADAPTERS` is empty because the hackathon has not announced
-   the provider, model or endpoint. `make run` accepts input, then stops with "No model provider is
-   configured …" / "Configured model provider is not supported by this build …" (exit 2). Adding the
-   prescribed provider means one adapter entry (`ModelClient.generate` over `urllib`), mapping
-   provider tool calls/text to `ModelResponse`. Nothing else depends on the provider.
-2. **Target interpreter.** Python verification commands use the repository's `.venv/bin/python`, else
-   the harness interpreter (`sys.executable`), which usually lacks the target's dependencies (e.g.
-   pytest). Such runs end BLOCKED (environment error) rather than being mis-verified, but they cannot
-   be VERIFIED until the evaluator environment provides the dependencies.
-3. **Only exercised on macOS** (Python 3.10–3.14). No Linux or evaluator-environment rehearsal yet.
+1. **Evaluator endpoint unknown.** The `openai_compatible` adapter works live (above), but the
+   organizers' endpoint, model ids and key scope are not confirmed, so no default is built in; the
+   evaluator must set `AI_MODEL_ADAPTER`, `AI_MODEL`, `AI_BASE_URL` (documented in README/.env.example).
+   Without them `make run` exits 2 with a precise message and modifies nothing.
+2. **Target interpreter.** For `python -m <runner>` the first interpreter that can import the runner is
+   used (target venv, harness, PATH `python3`/`python`); if none can, the run ends BLOCKED
+   (environment error), never mis-verified. No real pytest run has been executed on this machine
+   (pytest is not installed anywhere here).
+3. **Only exercised on macOS** (Python 3.10–3.14). `make setup` now falls back to a pip-less venv and
+   replaces partial venvs (simulated); not yet run on Linux.
 
 ## Completed
 
@@ -69,8 +89,7 @@ Last updated: 2026-09-26 (M6 complete and verified; not committed). **M6 was the
 
 ## Currently implementing
 
-Nothing. No further feature milestones are planned. Remaining work is the live adapter once the
-provider is announced, plus a rehearsal in the evaluator environment.
+Nothing. Remaining: confirm the evaluator's endpoint/model ids, and a Linux rehearsal.
 
 ## Verified — M6 evidence
 

@@ -7,21 +7,31 @@ unset. ``AI_API_KEY`` is the only required value and the only secret.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 # ---------------------------------------------------------------------------
-# ORGANIZER-PRESCRIBED MODEL
+# ORGANIZER-PRESCRIBED MODEL  (UNRESOLVED - fill in once the organizers confirm)
 #
-# The hackathon has not announced a provider, model or endpoint yet. When it
-# does, set these defaults here (or export AI_MODEL_PROVIDER / AI_MODEL /
-# AI_BASE_URL). Do not guess them.
+# The evaluation uses DeepSeek and Qwen models, but the exact endpoint(s), model
+# ids, transport and whether one key covers both are not confirmed yet. Do not
+# guess them. Set these defaults (or export the AI_MODEL_* variables) once known.
+#
+#   adapter   = transport/protocol:  "openai_compatible" (built in), others later
+#   provider  = model family label:  e.g. "deepseek", "qwen"  (informational only;
+#               it never selects the transport)
+#   model     = model id sent to the endpoint
+#   base_url  = endpoint root, e.g. ".../v1" ("/chat/completions" is appended)
 # ---------------------------------------------------------------------------
+DEFAULT_MODEL_ADAPTER: Optional[str] = None
 DEFAULT_MODEL_PROVIDER: Optional[str] = None
 DEFAULT_MODEL: Optional[str] = None
 DEFAULT_BASE_URL: Optional[str] = None
+DEFAULT_MODEL_TIMEOUT_SECONDS = 120
+DEFAULT_MODEL_MAX_RETRIES = 2
 
 DEFAULT_MAX_STEPS = 40
 DEFAULT_MAX_REPAIR_CYCLES = 3
@@ -33,6 +43,12 @@ DEFAULT_MAX_REPEATED_FAILURE_CYCLES = 2
 
 API_KEY_VAR = "AI_API_KEY"
 PROVIDER_VAR = "AI_MODEL_PROVIDER"
+ADAPTER_VAR = "AI_MODEL_ADAPTER"
+MODEL_TIMEOUT_VAR = "AI_MODEL_TIMEOUT_SECONDS"
+MODEL_MAX_RETRIES_VAR = "AI_MODEL_MAX_RETRIES"
+MODEL_HEADERS_VAR = "AI_MODEL_HEADERS"
+STRUCTURED_OUTPUT_VAR = "AI_MODEL_STRUCTURED_OUTPUT"
+STRUCTURED_OUTPUT_MODES = ("none", "json_object")
 MODEL_VAR = "AI_MODEL"
 BASE_URL_VAR = "AI_BASE_URL"
 MAX_STEPS_VAR = "HARNESS_MAX_STEPS"
@@ -66,9 +82,14 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class ModelSettings:
-    provider: Optional[str]
-    name: Optional[str]
+    provider: Optional[str]                  # model family label (deepseek, qwen, ...): informational
+    name: Optional[str]                      # model id sent to the endpoint
     base_url: Optional[str]
+    adapter: Optional[str] = None            # transport: selects the ModelClient implementation
+    timeout_seconds: int = DEFAULT_MODEL_TIMEOUT_SECONDS
+    max_retries: int = DEFAULT_MODEL_MAX_RETRIES          # transient transport failures only
+    headers: tuple[tuple[str, str], ...] = ()             # extra HTTP headers (e.g. gateway routing)
+    structured_output: str = "none"          # "json_object": ask the endpoint for JSON mode on planner calls
 
 
 @dataclass(frozen=True)
@@ -207,6 +228,12 @@ def load_config(
             provider=get(PROVIDER_VAR) or DEFAULT_MODEL_PROVIDER,
             name=get(MODEL_VAR) or DEFAULT_MODEL,
             base_url=base_url,
+            adapter=get(ADAPTER_VAR) or DEFAULT_MODEL_ADAPTER,
+            timeout_seconds=_positive_int(MODEL_TIMEOUT_VAR, get(MODEL_TIMEOUT_VAR), DEFAULT_MODEL_TIMEOUT_SECONDS),
+            max_retries=_positive_int(MODEL_MAX_RETRIES_VAR, get(MODEL_MAX_RETRIES_VAR), DEFAULT_MODEL_MAX_RETRIES,
+                                      allow_zero=True),
+            headers=_headers(get(MODEL_HEADERS_VAR)),
+            structured_output=_choice(STRUCTURED_OUTPUT_VAR, get(STRUCTURED_OUTPUT_VAR), STRUCTURED_OUTPUT_MODES, "none"),
         ),
         limits=Limits(
             max_steps=_positive_int(MAX_STEPS_VAR, get(MAX_STEPS_VAR), DEFAULT_MAX_STEPS),
@@ -240,6 +267,30 @@ def load_runtime_settings(
     get, _ = _settings(environ, dotenv_path)
     runs_dir = get(RUNS_DIR_VAR)
     return _bool(TELEMETRY_VAR, get(TELEMETRY_VAR), True), Path(runs_dir).expanduser() if runs_dir else None
+
+
+def _headers(raw: Optional[str]) -> tuple[tuple[str, str], ...]:
+    """AI_MODEL_HEADERS: a JSON object of extra HTTP headers. Values are never printed."""
+    if raw is None:
+        return ()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ConfigError(f"{MODEL_HEADERS_VAR} must be a JSON object of header names to string values") from None
+    if not isinstance(data, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        raise ConfigError(f"{MODEL_HEADERS_VAR} must be a JSON object of header names to string values")
+    if any(k.lower() == "authorization" for k in data):
+        raise ConfigError(f"{MODEL_HEADERS_VAR} must not set Authorization; the key comes from {API_KEY_VAR}")
+    return tuple(sorted(data.items()))
+
+
+def _choice(name: str, raw: Optional[str], allowed: tuple[str, ...], default: str) -> str:
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value not in allowed:
+        raise ConfigError(f"{name} must be one of {', '.join(allowed)} (got {raw!r})")
+    return value
 
 
 def _bool(name: str, raw: Optional[str], default: bool) -> bool:

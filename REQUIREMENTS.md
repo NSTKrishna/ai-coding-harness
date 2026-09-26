@@ -10,11 +10,19 @@ Status:
 ## R1 — Autonomous software engineering harness
 
 - [x] Accept software engineering task
-- [~] Understand task
+- [x] Understand task
 - [x] Inspect existing repository
 - [x] Determine relevant files
-- [~] Modify implementation
+- [x] Modify implementation
 - [x] Verify modifications
+
+Evidence (live, 2026-09-26):
+- 8 models (Qwen3-Coder-480B/-Next/-30B, Qwen3-235B-2507, Qwen3-Next-80B, Qwen3-32B, DeepSeek V3.2/V3.1)
+  on AWS Bedrock's OpenAI-compatible endpoint, 3 tasks each, through `harness run`: 21/24 VERIFIED.
+  Every VERIFIED repository passes its tests when re-run outside the harness, no test file was touched,
+  and every non-VERIFIED run also fails independently (PROGRESS.md "Live model evaluation").
+- Verification hardening from AUDIT.md (B1-B4, H3, M2, M3): tests/test_audit_regressions.py (each test
+  fails against the pre-fix engine and passes now).
 
 Evidence (M5, 2026-09-26):
 - Verify modifications: every completed execution is verified by the deterministic
@@ -402,9 +410,15 @@ Evidence (M1, 2026-09-26):
 
 ## R11 — Model
 
-- [~] text-only
-- [~] model configurable
+- [x] text-only
+- [x] model configurable
 - [x] provider abstraction exists
+
+Evidence (live, 2026-09-26):
+- `OpenAICompatibleClient` (src/harness/model/adapters/openai_compatible.py; stdlib urllib, no SDK),
+  selected by `AI_MODEL_ADAPTER` (never by model family); 31 contract tests incl. a local HTTP server
+  (tests/test_openai_compatible.py), the same scenario with ScriptedModel and the adapter, and an
+  import-boundary test (tests/test_adapter_end_to_end.py). Used live with 8 Qwen/DeepSeek models.
 
 Evidence (M4, 2026-09-26):
 - `model/factory.create_model_client` is the single construction boundary; it fails explicitly for

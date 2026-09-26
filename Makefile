@@ -19,12 +19,22 @@ ARGS ?=
 
 setup:
 	@$(PYTHON) -c 'import sys; sys.exit(0) if sys.version_info >= (3, 10) else sys.exit("error: Python >= 3.10 is required, found " + sys.version.split()[0] + ". Use: make setup PYTHON=python3.x")'
-	@test -x $(VENV_PY) || $(PYTHON) -m venv $(VENV)
+	@# Reuse a working venv; replace a partial one (e.g. left by a failed ensurepip). The harness needs no
+	@# packages at runtime, so when ensurepip is unavailable (Debian/Ubuntu without python3-venv) the venv
+	@# is created without pip.
+	@if [ -x $(VENV_PY) ] && $(VENV_PY) -c 'import sys' >/dev/null 2>&1; then :; else \
+	  rm -rf $(VENV); \
+	  $(PYTHON) -m venv $(VENV) >/dev/null 2>&1 || { rm -rf $(VENV); \
+	    echo "note: '$(PYTHON) -m venv' failed (ensurepip unavailable?); creating the venv without pip"; \
+	    $(PYTHON) -m venv --without-pip $(VENV); }; \
+	fi
 	@# Convenience only (see PY above); needs no network access.
 	@$(VENV_PY) -c 'import pathlib, sysconfig; pathlib.Path(sysconfig.get_paths()["purelib"], "harness-src.pth").write_text(str(pathlib.Path("src").resolve()) + "\n")'
 	@# Editable install only adds the `harness` console script; it may need network for setuptools.
-	@$(VENV_PY) -m pip install --disable-pip-version-check --quiet --no-deps -e . \
-	  || echo "warning: editable install failed (offline?). 'make run' and 'python -m harness' still work; the 'harness' command is unavailable."
+	@if $(VENV_PY) -m pip --version >/dev/null 2>&1; then \
+	  $(VENV_PY) -m pip install --disable-pip-version-check --quiet --no-deps -e . \
+	  || echo "warning: editable install failed (offline?). 'make run' and 'python -m harness' still work; the 'harness' command is unavailable."; \
+	else echo "note: no pip in the venv; skipping the optional editable install ('make run' works without it)."; fi
 	@$(PY) -c 'import harness, sys; print("harness", harness.__version__, "ready on Python", sys.version.split()[0])'
 	@touch $(STAMP)
 
