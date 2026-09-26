@@ -81,7 +81,7 @@ class EvidenceLedger:
                          excerpt=excerpt)
 
     def record_file_change(self, phase: str, path: str, description: str) -> EvidenceItem:
-        return self._add(kind=EvidenceKind.FILE_CHANGE, phase=phase, source="apply_patch", path=path,
+        return self._add(kind=EvidenceKind.FILE_CHANGE, phase=phase, source="edit", path=path,
                          description=description)
 
     def record_assessment(self, phase: str, criterion: str, status: str, refs: Sequence[str], notes: str) -> EvidenceItem:
@@ -113,7 +113,7 @@ class ChangeRecord:
 
 
 class ChangeLedger:
-    """Files this run changed with apply_patch. Not a rollback mechanism."""
+    """Files this run changed with its editing tools (apply_patch, edit_file, write_file). Not a rollback mechanism."""
 
     def __init__(self) -> None:
         self._records: dict[str, ChangeRecord] = {}

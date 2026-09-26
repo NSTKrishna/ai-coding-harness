@@ -1,4 +1,9 @@
-"""apply_patch: a pure-Python unified-diff applier (no ``patch`` binary, no git needed).
+"""File-editing tools: ``apply_patch`` (unified diff), ``edit_file`` (exact text
+replacement) and ``write_file`` (whole-file create/overwrite). All three return a
+``PatchResult`` with before/after content hashes, write atomically and go through
+the repository path boundary, so the rest of the harness treats every edit alike.
+
+apply_patch: a pure-Python unified-diff applier (no ``patch`` binary, no git needed).
 
 Supported: modifying, creating (``--- /dev/null``) and deleting (``+++ /dev/null``)
 UTF-8 text files, several files and hunks per patch, ``a/``/``b/`` prefixes,
@@ -361,7 +366,101 @@ def _atomic_write(target: Path, text: str) -> None:
         raise
 
 
+def _counts(before: str, after: str) -> tuple[int, int]:
+    """(added, removed) line counts: lines only in ``after`` / only in ``before`` (multiset difference)."""
+    from collections import Counter
+    a, b = Counter(before.splitlines()), Counter(after.splitlines())
+    return sum((b - a).values()), sum((a - b).values())
+
+
+def edit_file(ctx: ToolContext, path: str, old_text: str, new_text: str, replace_all: bool = False) -> PatchResult:
+    target = resolve_in_repo(ctx.root, path, for_write=True)
+    rel = relative_posix(ctx.root, target)
+    current = _read_current(ctx, target)
+    if current is None:
+        raise ToolFailure("not_found", f"{rel}: file does not exist (use write_file to create it)")
+    if old_text == "":
+        raise ToolFailure("invalid_arguments", "old_text must not be empty")
+    if old_text == new_text:
+        raise ToolFailure("invalid_arguments", "old_text and new_text are identical: nothing would change")
+    warnings: list[str] = []
+    count = current.count(old_text)
+    source = current
+    if count == 0 and "\r\n" in current and "\r\n" not in old_text:   # model wrote LF for a CRLF file
+        source = current.replace("\r\n", "\n")
+        count = source.count(old_text)
+    if count == 0:
+        near = [i + 1 for i, line in enumerate(current.splitlines())
+                if old_text.strip().splitlines() and old_text.strip().splitlines()[0].strip() == line.strip()]
+        hint = f"; the first line of old_text appears (ignoring indentation) at line(s) {near[:5]}" if near else ""
+        raise ToolFailure("edit_mismatch", f"{rel}: old_text was not found in the file (it must match exactly, "
+                          f"including indentation and blank lines){hint}. Re-read the file and copy the text exactly.",
+                          {"file": rel, "near_lines": near[:5]})
+    if count > 1 and not replace_all:
+        raise ToolFailure("edit_ambiguous", f"{rel}: old_text occurs {count} times; include more surrounding "
+                          "lines to make it unique, or set replace_all", {"file": rel, "occurrences": count})
+    updated = source.replace(old_text, new_text) if replace_all else source.replace(old_text, new_text, 1)
+    if source is not current:
+        updated = updated.replace("\n", "\r\n")
+        warnings.append(f"{rel}: matched after normalizing CRLF line endings")
+    _write_all(ctx, {target: (current, updated)})
+    added, removed = _counts(current, updated)
+    return PatchResult(files=(PatchedFile(rel, "modified", count if replace_all else 1, added, removed,
+                                          _sha256(current), _sha256(updated)),), warnings=tuple(warnings))
+
+
+def write_file(ctx: ToolContext, path: str, content: str) -> PatchResult:
+    target = resolve_in_repo(ctx.root, path, for_write=True)
+    rel = relative_posix(ctx.root, target)
+    if target.exists() and not target.is_file():
+        raise ToolFailure("not_a_file", f"{rel}: is not a regular file")
+    current = _read_current(ctx, target)
+    if current == content:
+        raise ToolFailure("invalid_arguments", f"{rel}: content is identical to the file: nothing would change")
+    if content and not content.endswith("\n"):
+        content += "\n"
+    _write_all(ctx, {target: (current, content)})
+    added, removed = _counts(current or "", content)
+    return PatchResult(files=(PatchedFile(rel, "created" if current is None else "modified", 1, added, removed,
+                                          _sha256(current), _sha256(content)),))
+
+
 TOOLS = (
+    Tool(
+        name="edit_file",
+        description="Replace text in an existing file: old_text must match the file exactly (including "
+                    "indentation) and occur exactly once, unless replace_all is true. Preferred for small, "
+                    "targeted edits; include a few surrounding lines in old_text to make it unique.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Repository-relative file path."},
+                "old_text": {"type": "string", "description": "Exact existing text to replace."},
+                "new_text": {"type": "string", "description": "Replacement text."},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)."},
+            },
+            "required": ["path", "old_text", "new_text"],
+            "additionalProperties": False,
+        },
+        handler=edit_file,
+        category="write",
+    ),
+    Tool(
+        name="write_file",
+        description="Create a new file, or replace the entire content of an existing file. Use for new files; "
+                    "prefer edit_file for changes to existing files.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Repository-relative file path."},
+                "content": {"type": "string", "description": "The complete new file content."},
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+        handler=write_file,
+        category="write",
+    ),
     Tool(
         name="apply_patch",
         description="Apply a unified diff (as produced by 'git diff' or 'diff -u') to files in the "

@@ -46,6 +46,10 @@ def summarize_arguments(call: ToolCall) -> str:
         patch = args["patch"]
         files = re.findall(r"^\+\+\+ (?:b/)?(\S+)", patch, re.MULTILINE)
         return f"patch of {patch.count(chr(10)) + 1} lines for {', '.join(files) or '?'}"[:MAX_ARGUMENT_SUMMARY]
+    if call.name in ("edit_file", "write_file") and isinstance(args.get("path"), str):
+        body = args.get("new_text", args.get("content"))
+        size = f", {str(body).count(chr(10)) + 1} new line(s)" if isinstance(body, str) else ""
+        return f"{call.name} {args['path']}{size}"[:MAX_ARGUMENT_SUMMARY]
     try:
         text = json.dumps(dict(args), sort_keys=True)
     except (TypeError, ValueError):
