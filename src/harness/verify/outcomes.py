@@ -9,8 +9,9 @@ small and conservative:
   code under test imports is a code failure, not an environment problem.
 - A failure fingerprint is the set of failing test ids that common runners
   print (unittest, pytest, go test, cargo, jest/vitest file lines), plus a hash
-  of the normalized output tail. Comparison prefers test ids; without ids it
-  compares hashes.
+  of the normalized output tail. Comparison uses test ids; when neither side
+  prints ids, fail -> fail counts as the same failure (a changed hash alone is
+  noise, not a regression).
 """
 
 from __future__ import annotations
@@ -231,4 +232,10 @@ def compare(baseline: Optional[Classification], post: Classification) -> Compari
         if after.failing_tests < before.failing_tests:
             return Comparison.IMPROVED
         return Comparison.CHANGED_FAILURE
-    return Comparison.UNCHANGED_FAILURE if after.output_hash == before.output_hash else Comparison.CHANGED_FAILURE
+    if after.failing_tests and not before.failing_tests:
+        return Comparison.CHANGED_FAILURE          # failing tests are now identified where none were before
+    if before.failing_tests and not after.failing_tests and after.output_hash != before.output_hash:
+        return Comparison.CHANGED_FAILURE          # identified failures replaced by something else (e.g. a crash)
+    # No test ids on either side: output hashes of unparsed runners are unstable (ordering, messages),
+    # so a different hash is not evidence of a regression; it is compared as the same failure.
+    return Comparison.UNCHANGED_FAILURE

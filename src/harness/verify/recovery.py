@@ -51,8 +51,18 @@ class RepairContext:
     diff_excerpt: str
     prior_attempts: tuple[str, ...]
     repeated_failure: bool
+    round: int = 0                                               # verification round the failure is from
+    change_state: tuple[tuple[str, Optional[str]], ...] = ()     # (path, sha256) at that verification
 
-    def render(self) -> str:
+    def patched_since(self, current: Optional[tuple] = None) -> tuple[str, ...]:
+        """Files patched after the verification this context describes."""
+        if current is None:
+            return ()
+        before = dict(self.change_state)
+        return tuple(sorted(p for p, sha in current if before.get(p, "<absent>") != sha))
+
+    def render(self, current_change_state: Optional[tuple] = None) -> str:
+        at = f" at verification round {self.round}" if self.round else ""
         lines = [f"# Repair (cycle {self.cycle} of at most {self.max_cycles})",
                  "Verification of your previous changes FAILED. Fix the problem below, then reply complete.",
                  "Verification will run again automatically; 'complete' is not evidence.",
@@ -61,7 +71,7 @@ class RepairContext:
             lines.append(f"Failing command: {self.failing_command} (before change: {self.baseline_status}, "
                          f"after change: {self.post_status})")
         if self.failure_output:
-            lines += ["Output (tail):", self.failure_output]
+            lines += [f"Output{at} (tail):", self.failure_output]
         if self.failed_criteria:
             lines += ["Acceptance criteria failing:"] + [f"- {c}" for c in self.failed_criteria]
         lines.append("Files changed by this run: " + (", ".join(self.modified_files) or "none"))
@@ -69,7 +79,12 @@ class RepairContext:
             lines.append("Current contents re-read for: " + ", ".join(self.fresh_files)
                          + " (see working context; earlier reads are stale)")
         if self.diff_excerpt:
-            lines += ["Current diff (excerpt):", self.diff_excerpt]
+            lines += [f"Diff{at} (excerpt):", self.diff_excerpt]
+        patched = self.patched_since(current_change_state)
+        if patched:
+            lines.append(f"NOTE: you have patched {', '.join(patched)} since verification round {self.round}; "
+                         "the output and diff above are from BEFORE those patches. Use read_file (or run the "
+                         "tests) to see the current state; reply complete to have verification run again.")
         if self.prior_attempts:
             lines += ["Previous verification/repair history:"] + [f"- {a}" for a in self.prior_attempts]
         if self.repeated_failure:
@@ -178,6 +193,7 @@ class RecoveryController:
             failure_output=(failing.post.classification.excerpt[-MAX_OUTPUT_EXCERPT:] if failing else ""),
             failed_criteria=failed_criteria, modified_files=tuple(report.changed_by_run), fresh_files=tuple(fresh),
             diff_excerpt=diff_text, prior_attempts=tuple(facts[-MAX_FACTS_SHOWN:]), repeated_failure=repeated,
+            round=report.round, change_state=tuple(report.change_state),
         )
 
 

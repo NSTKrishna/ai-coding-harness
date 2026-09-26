@@ -9,9 +9,14 @@ Verdict policy (documented in arch.md §14):
 1. NEEDS_REPAIR if any repairable failure was found (regression, task test still
    failing, new build/lint/typecheck failure, new timeout, a criterion known to
    FAIL, or no change made although the plan has edit steps).
-2. VERIFIED if none of the above and there is STRONG evidence that the task was
-   resolved: a command went fail -> pass, or fail -> fewer failures with no new ones;
-   or every acceptance criterion is PASS by a deterministic structural check.
+2. VERIFIED if none of the above, the run changed at least one file, and there is
+   STRONG evidence that the task was resolved: a *test* command went fail -> pass,
+   or fail -> fewer failures with no new ones; or every acceptance criterion is PASS
+   by a structural check on a file this run created or changed.
+   Test evidence is never strong when the run modified or deleted a pre-existing
+   test file, when the post-change run executed fewer tests than the baseline, or
+   when the baseline had timed out. Build/lint/typecheck commands only guard against
+   regressions; their fail -> pass is not evidence that the task was resolved.
    WEAK evidence (a command passed before and after, including with more tests)
    only shows "no detected regression" and never verifies a task on its own (M6).
 3. BLOCKED if verification commands exist but none could run for environment
@@ -32,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from harness.repo.classify import is_test_path
 from harness.repo.signals import extract_task_signals, normalize_name
 from harness.tools.paths import resolve_in_repo
 from harness.tools.base import ToolFailure
@@ -152,6 +158,7 @@ class VerificationReport:
     diff_evidence_id: Optional[str]
     risks: tuple[str, ...]
     change_state: tuple[tuple[str, Optional[str]], ...] = ()   # (path, current sha256) of patched files
+    tampered_tests: tuple[str, ...] = ()   # pre-existing test files this run modified or deleted
 
     @property
     def primary_failure(self) -> Optional[CommandVerification]:
@@ -239,12 +246,17 @@ class VerificationEngine:
         baseline: BaselineResult = self.state.baseline
         runs, not_run = self._run_commands(phase, escalate=True)
         final = self.snapshot(phase, with_diff=True)
+        changed = self.changes.net_changed()
+        outside = self._changed_outside_patches(baseline, final)
+        tampered = self._tampered_tests(changed, final, outside)
 
-        results = [self._assess_command(baseline.run_for(r.command.id) if baseline else None, r)
+        results = [self._assess_command(baseline.run_for(r.command.id) if baseline else None, r, tampered)
                    for r in runs]
         risks = [f"{cid} not run: {reason}" for cid, reason in not_run]
+        if tampered:
+            risks.append("this run modified or deleted pre-existing test file(s): " + ", ".join(tampered)
+                         + "; test results cannot show that the task was resolved")
 
-        changed = self.changes.net_changed()
         change_items = []
         for record in self.changes.records:
             if record.path in changed:
@@ -257,7 +269,6 @@ class VerificationEngine:
             diff_id = self.ledger.record_diff(phase, f"working-tree diff at verification round {round_no}",
                                               final.diff_excerpt).id
         preexisting = tuple(sorted(baseline.initial.paths)) if baseline else ()
-        outside = self._changed_outside_patches(baseline, final)
         if preexisting:
             touched = sorted(set(preexisting) & set(changed))
             risks.append("pre-existing uncommitted changes (not made by this run): " + ", ".join(preexisting)
@@ -265,7 +276,7 @@ class VerificationEngine:
         if outside:
             risks.append("changed during the run but not by patches (e.g. by commands): " + ", ".join(outside))
 
-        criteria = self._assess_criteria(phase, results, change_items)
+        criteria = self._assess_criteria(phase, results, change_items, changed, trust_tests=not tampered)
         findings = [r.finding for r in results if r.finding is not None]
         plan = self.state.plan
         expects_edit = plan is not None and any(s.kind == "edit" for s in plan.steps)
@@ -286,21 +297,55 @@ class VerificationEngine:
         verdict, failure_class, summary = self._decide(results, findings, changed, criteria)
         change_state = tuple((r.path, r.current_sha256) for r in self.changes.records)
         return VerificationReport(round_no, verdict, failure_class, summary, tuple(results), tuple(criteria),
-                                  tuple(changed), preexisting, outside, diff_id, tuple(risks), change_state)
+                                  tuple(changed), preexisting, outside, diff_id, tuple(risks), change_state,
+                                  tuple(tampered))
 
-    def _assess_command(self, base: Optional[CommandRun], post: CommandRun) -> CommandVerification:
+    def _tampered_tests(self, changed, final: RepoSnapshot, outside) -> list[str]:
+        """Pre-existing test files the run modified or deleted (by patch, or by a command).
+        New test files are not tampering; their passing is weak evidence at most."""
+        by_patch = [r.path for r in self.changes.records
+                    if r.path in changed and r.before_sha256 is not None and is_test_path(r.path)]
+        status = dict(final.status) if final.available else {}
+        by_command = [p for p in outside if is_test_path(p) and status.get(p, "") != "??"]
+        return sorted(set(by_patch) | set(by_command))
+
+    @staticmethod
+    def _strength_caveat(base: CommandRun, post: CommandRun, tampered) -> Optional[str]:
+        """Why a fail -> pass (or fewer failures) of a test command is not strong evidence, if it is not."""
+        if tampered:
+            return "test files it may run were modified or deleted by this run (" + ", ".join(tampered) + ")"
+        if base.classification.status == CommandStatus.TIMEOUT:
+            return "the baseline timed out, so the earlier failure was not observed"
+        before = base.classification.fingerprint.tests_run if base.classification.fingerprint else None
+        after = post.classification.fingerprint.tests_run if post.classification.fingerprint else None
+        if before is not None and (after is None or after < before):
+            return f"fewer tests ran than at baseline ({before} -> {after if after is not None else 'unknown'})"
+        return None
+
+    def _assess_command(self, base: Optional[CommandRun], post: CommandRun, tampered=()) -> CommandVerification:
         cmd = post.command
         comparison = compare(base.classification if base else None, post.classification)
         finding, positive, note = None, "", ""
         failure_kind = FailureClass.TASK_TEST_FAILURE if cmd.kind == "test" else CHECK_FAILURE_CLASS.get(
             cmd.kind, FailureClass.BUILD_FAILURE)
-        if comparison == Comparison.FIXED:
-            positive, note = "strong", "failed before the change, passes after it"
-        elif comparison == Comparison.IMPROVED:
-            fixed = sorted(base.classification.fingerprint.failing_tests - post.classification.fingerprint.failing_tests)
-            remaining = sorted(post.classification.fingerprint.failing_tests)
-            positive = "strong"
-            note = f"fixed {', '.join(fixed)}; still failing as before the change (pre-existing): {', '.join(remaining)}"
+        if comparison in (Comparison.FIXED, Comparison.IMPROVED):
+            if comparison == Comparison.FIXED:
+                note = "failed before the change, passes after it"
+            else:
+                fixed = sorted(base.classification.fingerprint.failing_tests
+                               - post.classification.fingerprint.failing_tests)
+                remaining = sorted(post.classification.fingerprint.failing_tests)
+                note = (f"fixed {', '.join(fixed)}; still failing as before the change (pre-existing): "
+                        f"{', '.join(remaining)}")
+            caveat = self._strength_caveat(base, post, tampered) if cmd.kind == "test" else None
+            if cmd.kind != "test":
+                positive = "weak"
+                note += f" ({cmd.kind} check: guards against regressions, does not show the task was resolved)"
+            elif caveat:
+                positive = "weak"
+                note += f"; not strong evidence: {caveat}"
+            else:
+                positive = "strong"
         elif comparison == Comparison.UNCHANGED_PASS:
             before, after = base.classification.fingerprint.tests_run, post.classification.fingerprint.tests_run
             if before is not None and after is not None and after > before:
@@ -335,37 +380,48 @@ class VerificationEngine:
             note = f"cannot be used as evidence: {post.classification.status.value}"
         return CommandVerification(cmd, base, post, comparison, finding, positive, note)
 
-    def _assess_criteria(self, phase: str, results, change_items) -> list[CriterionResult]:
+    def _assess_criteria(self, phase: str, results, change_items, changed=(),
+                         trust_tests: bool = True) -> list[CriterionResult]:
+        """Map criteria to observed test ids by name (a heuristic), in this order:
+        a related test that newly fails -> FAIL; a related test that went fail -> pass (only
+        from strong command evidence) -> PASS; a related test failing as at baseline -> FAIL;
+        a structural check on a file this run created/changed -> PASS; else UNKNOWN."""
         plan = self.state.plan
         if plan is None:
             return []
-        fixed, failing = {}, {}
+        fixed, new_failing, old_failing = {}, {}, {}
         for r in results:
             if r.command.kind != "test":
                 continue
             post_fp = r.post.classification.fingerprint
             post_failing = post_fp.failing_tests if post_fp else frozenset()
-            if r.baseline is not None and r.baseline.classification.fingerprint is not None:
-                for test_id in r.baseline.classification.fingerprint.failing_tests - post_failing:
-                    if r.post.classification.status in (CommandStatus.PASS, CommandStatus.TEST_FAILURE):
-                        fixed[test_id] = fixed.get(test_id, ()) + (r.baseline.evidence_id, r.post.evidence_id)
+            base_fp = r.baseline.classification.fingerprint if r.baseline is not None else None
+            base_failing = base_fp.failing_tests if base_fp else frozenset()
+            if trust_tests and r.positive == "strong":
+                for test_id in base_failing - post_failing:
+                    fixed[test_id] = fixed.get(test_id, ()) + (r.baseline.evidence_id, r.post.evidence_id)
             for test_id in post_failing:
-                failing[test_id] = failing.get(test_id, ()) + (r.post.evidence_id,)
+                target = old_failing if test_id in base_failing else new_failing
+                target[test_id] = target.get(test_id, ()) + (r.post.evidence_id,)
         results_out = []
         for criterion in plan.acceptance_criteria:
             terms = self._criterion_terms(criterion)
-            fail_hits = [t for t in failing if any(term in normalize_name(t) for term in terms)]
-            pass_hits = [t for t in fixed if any(term in normalize_name(t) for term in terms)]
-            structural = self._structural(criterion)
-            if fail_hits:
-                refs = sorted({e for t in fail_hits for e in failing[t]}, key=_evidence_order)
-                status, notes = "FAIL", f"related test(s) fail after the change: {', '.join(sorted(fail_hits))}"
+            hits = lambda ids: [t for t in ids if any(term in normalize_name(t) for term in terms)]
+            new_hits, pass_hits, old_hits = hits(new_failing), hits(fixed), hits(old_failing)
+            structural = self._structural(criterion, changed)
+            if new_hits:
+                refs = sorted({e for t in new_hits for e in new_failing[t]}, key=_evidence_order)
+                status, notes = "FAIL", f"related test(s) fail after the change: {', '.join(sorted(new_hits))}"
             elif pass_hits:
                 refs = sorted({e for t in pass_hits for e in fixed[t]}, key=_evidence_order)
                 status, notes = "PASS", f"related test(s) failed before and pass after: {', '.join(sorted(pass_hits))}"
+            elif old_hits:
+                refs = sorted({e for t in old_hits for e in old_failing[t]}, key=_evidence_order)
+                status, notes = "FAIL", (f"related test(s) still fail as before the change: "
+                                         f"{', '.join(sorted(old_hits))}")
             elif structural:
                 refs = [i for i in change_items if self.ledger.get(i).path == structural] or []
-                status, notes = "PASS", f"{structural} exists after the change (structural check only)"
+                status, notes = "PASS", f"{structural} was created/changed by this run (structural check only)"
             else:
                 refs, status, notes = [], "UNKNOWN", "no observed evidence maps to this criterion"
             item = self.ledger.record_assessment(phase, criterion, status, refs, notes)
@@ -378,11 +434,14 @@ class VerificationEngine:
         terms = [normalize_name(i) for i in signals.identifiers] + list(signals.name_parts)
         return [t for t in dict.fromkeys(terms) if len(t) >= 4]
 
-    def _structural(self, criterion: str) -> Optional[str]:
+    def _structural(self, criterion: str, changed=()) -> Optional[str]:
+        """A criterion that asks for a file to exist, naming a file this run created or changed."""
         text = criterion.lower()
         if not any(w in text for w in ("exist", "creat", "add", "present")):
             return None
         for path in extract_task_signals(criterion).explicit_paths:
+            if path not in changed:
+                continue
             try:
                 if resolve_in_repo(self.root, path).is_file():
                     return path
@@ -408,10 +467,14 @@ class VerificationEngine:
             return Verdict.NEEDS_REPAIR, primary, f"{primary.value}{where}"
         strong = [r for r in results if r.positive == "strong"]
         weak = [r for r in results if r.positive == "weak"]
+        if not changed and (strong or weak):
+            return (Verdict.UNVERIFIED, FailureClass.NO_VERIFICATION_EVIDENCE,
+                    "this run changed no file, so no result can be attributed to it: "
+                    + "; ".join(f"{r.command.id} {r.note}" for r in strong + weak))
         if strong:
             return (Verdict.VERIFIED, None,
                     "strong evidence: " + "; ".join(f"{r.command.id} {r.note}" for r in strong))
-        if criteria and all(c.status == "PASS" and "structural check" in c.notes for c in criteria):
+        if changed and criteria and all(c.status == "PASS" and "structural check" in c.notes for c in criteria):
             return (Verdict.VERIFIED, None, "structural evidence: every acceptance criterion is a file that "
                     "exists after the change (" + "; ".join(c.criterion for c in criteria) + ")")
         if weak:
