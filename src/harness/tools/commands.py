@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -28,8 +29,11 @@ from harness.config import API_KEY_VAR
 from harness.tools.base import Tool, ToolContext, ToolFailure
 from harness.tools.paths import relative_posix, resolve_in_repo
 
-# Removed from every child process environment.
-SCRUBBED_ENV_VARS = frozenset({API_KEY_VAR})
+# Removed from every child process environment: the credential, and the harness's own
+# Python import configuration (the Makefile puts the harness's src/ on PYTHONPATH), which
+# must not leak into the target's test runs. Other variables are inherited (guardrail,
+# not sandbox; see arch.md).
+SCRUBBED_ENV_VARS = frozenset({API_KEY_VAR, "PYTHONPATH", "PYTHONHOME"})
 
 # Set for run_command / run_tests. Python must not write bytecode caches: a .pyc
 # written by one run (e.g. the baseline) can be reused for a same-size source edit
@@ -367,8 +371,18 @@ def read_bounded(stream: IO[bytes], limit: int) -> tuple[str, int, bool]:
 # Tools
 # --------------------------------------------------------------------------
 
+def _alias_python(argv: list[str]) -> list[str]:
+    """A bare ``python`` that does not exist (e.g. macOS ships only ``python3``) runs as ``python3``.
+    The substitution is visible in ``CommandResult.command``."""
+    if argv and argv[0] == "python" and shutil.which("python") is None:
+        found = shutil.which("python3")
+        if found:
+            return [found, *argv[1:]]
+    return argv
+
+
 def _run(ctx: ToolContext, command: Command, cwd: Optional[str], timeout_seconds: Optional[int]) -> CommandResult:
-    argv = parse_command(command)
+    argv = _alias_python(list(parse_command(command)))
     workdir = resolve_in_repo(ctx.root, cwd) if cwd else ctx.root
     if not workdir.is_dir():
         raise ToolFailure("not_a_directory", f"cwd '{cwd}' is not a directory")

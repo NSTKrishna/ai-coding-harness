@@ -19,6 +19,8 @@ as NOT_RUN. Every run is a normal registry dispatch and counts toward
 
 from __future__ import annotations
 
+import shlex
+
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -41,7 +43,7 @@ class VerificationCommand:
 
     @property
     def text(self) -> str:
-        return " ".join(self.argv)
+        return shlex.join(self.argv)   # quoted: a model may copy it verbatim as a command string
 
 
 def select_verification_commands(plan, profile, repo_root: Path, max_commands: int,
