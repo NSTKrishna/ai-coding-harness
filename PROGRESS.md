@@ -1,6 +1,62 @@
 # Implementation Progress
 
-Last updated: 2026-09-26 (M6 + DeepSeek/Qwen adapter + AUDIT.md fixes + live Bedrock evaluation; not committed).
+Last updated: 2026-09-27 (terminal UI/UX redesign on top of M6; not committed).
+
+## Terminal UI/UX redesign (2026-09-27)
+
+Presentation layer only — no orchestration, verification, budget, context or model
+change; `arch.md`'s architecture principle is unaffected. Goal: make `make run` read
+like a polished coding-agent product (concise header, live phase/tool activity,
+boxed final result) instead of a config dump followed by a flat log, while keeping
+every non-interactive/CI path byte-for-byte deterministic.
+
+- New `src/harness/ui/` package: `theme.py` (NO_COLOR/TERM=dumb/TTY/encoding/width
+  detection; ASCII-safe symbol vocabulary), `format.py` (GitHub issue URL parsing,
+  duration/path formatting, tool-activity headlines, read-only `git` repo header),
+  `input.py` (single-Enter task/URL submission; explicit `:multi` for a longer,
+  blank-line-terminated task), `renderer.py` (`PlainRenderer` — deterministic,
+  ANSI-free, reuses `orchestrator.report.format_run` verbatim for the final text;
+  `InteractiveRenderer` — TTY-only in-place breadcrumb + activity block), `header.py`
+  (concise pre-run header + `--verbose` details + start confirmation), `final_screen.py`
+  (boxed VERIFIED/UNVERIFIED/BLOCKED/BUDGET_EXHAUSTED panel and the `Ctrl-C` "Run
+  cancelled" panel, both read-only consumers of `RunState` like `report.py` already is).
+- `cli.py`: replaced the unconditional config dump (API key/base URL/`.env` path
+  printed before every run) with the concise header; added `--verbose` and
+  `--no-interactive`; the live view is fed by the existing `state.event_sink`
+  telemetry stream (no parallel event system); `Ctrl-C` now prints a graceful
+  "Run cancelled" panel (modified files / run id / artifact path when available)
+  instead of a bare "Interrupted."; `harness runs` gained repository name + relative
+  age columns.
+- `telemetry.py`: additive only — `RunRecorder` gained an optional `listener`
+  callback (invoked with the same bounded, redacted metadata already written to
+  `events.jsonl`); new `LiveObserver` (same interface, no disk I/O) so the live view
+  also works with `HARNESS_TELEMETRY=false`; `list_runs()` gained a `repository`
+  field. Disk artifact content/format is unchanged.
+- `orchestrator/observe.py`: one new pure function, `short_result()`, for a short
+  tool-result detail string (e.g. `+12 -4`, `exit 0`, `3 match(es)`) in the live
+  view; `observe()` itself (the evidence path) is untouched.
+- Zero new runtime dependencies (stdlib + ANSI escapes only); `make setup`'s offline
+  guarantee is unaffected.
+
+Verified: `make clean && make setup && make test` → **528 tests OK**, up from 456 on
+this checkout before this change (net +72: new `test_ui_format.py`/`test_ui_input.py`/
+`test_ui_renderer.py`, plus `test_cli.py` rewritten for the new header/confirmation/
+Ctrl-C/verbose/GitHub-issue behavior — the earlier "380" in this file's history was
+the M6-only count and predates several already-committed test files on this branch).
+`RunExecutionTest` (VERIFIED/UNVERIFIED/MODEL_ERROR wording, evidence, artifact
+filenames) needed **no changes**:
+those tests run through `io.StringIO` (non-TTY), which keeps using `PlainRenderer` +
+`format_run()` exactly as before. Manual PTY verification (`pty.fork`, real terminal):
+single-line task submits on Enter; GitHub issue URL detected and shown as an Issue
+block; `:multi` multiline works; `Ctrl-C` during input prints the graceful cancellation
+panel; 60-column width; `NO_COLOR=1` (color off, Unicode symbols unaffected — a
+separate capability); redirected/non-TTY output has no ANSI/cursor codes and skips
+the confirmation; `--repo`/`--task` (the `make run ARGS='...'` flow) gets the same
+header/confirmation as the prompted flow. `Ctrl-C` during live execution is covered
+by `test_ctrl_c_during_execution_is_graceful` (no live model adapter exists yet to
+demonstrate it end-to-end in a real terminal — the same pre-existing limitation
+noted below). `git status`: only the files listed above; no `.harness/` created in
+the project by any manual check.
 
 ## Current state
 

@@ -27,14 +27,33 @@ make setup
 make run
 ```
 
-`make run` prompts for the repository path and the task (end the task with an
-empty line). It needs `AI_MODEL_ADAPTER`, `AI_MODEL` and `AI_BASE_URL` (see "Model
-configuration"); without them it exits with code 2, says what is missing and
-modifies nothing. You can also pass the input directly:
+`make run` shows a concise header (repository, task or GitHub issue, model) and,
+on a real terminal, a live view of discovery/plan/baseline/execute/verify/repair
+as it happens. Interactive prompts: `Repository ›`/`Task ›` accept a single line
+(including a GitHub issue URL) immediately on Enter; type `:multi` and Enter for
+a longer, blank-line-terminated task. `--verbose` shows configuration diagnostics
+(adapter, base URL, limits, `.env` file — never the API key value); `--no-interactive`
+disables the start confirmation and any animation, for scripts and CI. `Ctrl-C`
+is graceful at every stage (no changes committed, or the modified files and run
+id if execution had started). It needs `AI_MODEL_ADAPTER`, `AI_MODEL` and
+`AI_BASE_URL` (see "Model configuration"); without them it exits with code 2,
+says what is missing and modifies nothing. You can also pass the input directly:
+
+GitHub issues: when the task is an issue URL, the harness fetches the issue's title,
+body, labels and recent comments (with the `gh` CLI when installed, otherwise the public
+API; `--no-fetch-issue` skips this) and warns if the issue is closed or belongs to a
+different repository than the target's remotes. It then starts on a **new branch**
+`harness/issue-<n>` cut from the freshly fetched default branch of `upstream` (or
+`origin`): your local `main` is never modified, uncommitted tracked changes make it stay
+on the current branch (or refuse, with `--branch`), and nothing is forced or reset. Use
+`--branch` to do this for any task and `--no-branch` to stay where you are. The branch is
+created only after the model client is configured, so a misconfigured run changes nothing.
 
 ```sh
 make run ARGS='--repo /path/to/repo --task "Fix the failing date parser test"'
-make run ARGS='--repo /path/to/repo --task-file issue.md'
+make run ARGS='--repo /path/to/repo --task https://github.com/owner/repo/issues/42'
+make run ARGS='--repo /path/to/repo --task-file issue.md --branch'
+make run ARGS='--repo /path/to/repo --task "..." --verbose'
 PYTHONPATH=src .venv/bin/python -m harness run --repo /path/to/repo --task-file issue.md
 ```
 

@@ -29,7 +29,7 @@ BUILD_OUTPUT_DIRS = frozenset({
     "build", "dist", "target", "out", "coverage", "htmlcov", ".next", ".nuxt", ".eggs",
     ".gradle", ".parcel-cache", ".turbo",
 })
-DEFAULT_MAX_FILES = 50_000
+DEFAULT_MAX_FILES = 200_000
 
 
 @dataclass(frozen=True)

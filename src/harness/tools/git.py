@@ -30,8 +30,11 @@ _GIT_ENV = {
 }
 _GIT_FLAGS = ["-c", "core.quotepath=off", "-c", "color.ui=never", "--no-pager"]
 _MAX_UNTRACKED_DIFFS = 200
-# Cap for machine-readable output (status, ls-files, numstat), which must not be cut.
+# Cap for machine-readable output (status, numstat), which must not be cut.
 _MACHINE_OUTPUT_BYTES = 5_000_000
+# ls-files of a large monorepo (e.g. 74k paths = 6.5 MB) must still fit, or discovery
+# silently falls back to a filesystem walk that ignores .gitignore.
+_LISTING_OUTPUT_BYTES = 64_000_000
 
 
 @dataclass(frozen=True)
@@ -136,10 +139,10 @@ def git_list_files(ctx: ToolContext, *, tracked: bool) -> list[str]:
     """
     _require_repo(ctx)
     which = ["--cached"] if tracked else ["--others", "--exclude-standard"]
-    result = _git(ctx, "ls-files", *which, "-z", "--", ".", max_bytes=_MACHINE_OUTPUT_BYTES)
+    result = _git(ctx, "ls-files", *which, "-z", "--", ".", max_bytes=_LISTING_OUTPUT_BYTES)
     if result.truncated:
         raise ToolFailure("git_output_too_large",
-                          f"git ls-files output exceeds {_MACHINE_OUTPUT_BYTES} bytes")
+                          f"git ls-files output exceeds {_LISTING_OUTPUT_BYTES} bytes")
     return sorted(p for p in result.stdout.split("\0") if p)
 
 

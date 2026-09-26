@@ -75,9 +75,14 @@ def _bounded(value: Any, redact: Callable[[str], str]) -> Any:
 
 
 class RunRecorder:
-    def __init__(self, runs_dir: Path, redact: Optional[Callable[[str], str]] = None) -> None:
+    def __init__(self, runs_dir: Path, redact: Optional[Callable[[str], str]] = None,
+                 listener: Optional[Callable[[str, dict, str], None]] = None) -> None:
+        """``listener(event_name, metadata, phase)``, if given, is called for every event in
+        addition to the disk write (e.g. to drive a live UI). It receives the same bounded,
+        redacted metadata that is written to ``events.jsonl`` — never anything extra."""
         self.runs_dir = Path(runs_dir)
         self.redact = redact or (lambda text: text)
+        self.listener = listener
         self.run_dir: Optional[Path] = None
         self.state = None
         self._events = None
@@ -100,14 +105,17 @@ class RunRecorder:
     def event(self, name: str, **metadata) -> None:
         if self._events is None:
             return
+        bounded = _bounded(metadata, self.redact)
         if self._seq >= MAX_EVENTS:
             self.events_dropped += 1
-            return
-        self._seq += 1
-        record = {"ts": _now(), "seq": self._seq, "run_id": self.state.run_id,
-                  "phase": self.state.phase.value, "event": name, **_bounded(metadata, self.redact)}
-        self._events.write(json.dumps(record, sort_keys=True, default=str) + "\n")
-        self._events.flush()
+        else:
+            self._seq += 1
+            record = {"ts": _now(), "seq": self._seq, "run_id": self.state.run_id,
+                      "phase": self.state.phase.value, "event": name, **bounded}
+            self._events.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+            self._events.flush()
+        if self.listener is not None:
+            self.listener(name, bounded, self.state.phase.value)
 
     def finish(self, state, ctx=None) -> Optional[Path]:
         if self.run_dir is None:
@@ -161,6 +169,46 @@ class RunRecorder:
         return RecordingRegistry(registry, self)
 
 
+class LiveObserver:
+    """Same interface as ``RunRecorder`` (``start``/``event``/``finish``/``wrap_model``/
+    ``wrap_registry``), used when artifact writing is disabled (``HARNESS_TELEMETRY=false``)
+    but a live UI still needs the event stream. Writes nothing to disk and keeps no history;
+    it only forwards each event to ``listener`` and remembers ``state`` so a caller can read
+    it back (e.g. after a ``KeyboardInterrupt``)."""
+
+    def __init__(self, listener: Callable[[str, dict, str], None],
+                 redact: Optional[Callable[[str], str]] = None) -> None:
+        self.listener = listener
+        self.redact = redact or (lambda text: text)
+        self.run_dir: Optional[Path] = None
+        self.state = None
+
+    def start(self, state) -> None:
+        self.state = state
+        state.event_sink = self._sink
+        self.event("run_started", task=state.task.strip().splitlines()[0] if state.task.strip() else "",
+                   repository=state.repo_root)
+
+    def _sink(self, name: str, metadata: dict) -> None:
+        self.event(name, **metadata)
+
+    def event(self, name: str, **metadata) -> None:
+        self.listener(name, _bounded(metadata, self.redact), self.state.phase.value if self.state is not None else "")
+
+    def finish(self, state, ctx=None) -> Optional[Path]:
+        self.event("run_finished", final_status=state.phase.value, terminal_reason=state.terminal_reason or "",
+                   model_calls=state.model_calls, tool_calls=state.tool_calls, steps=state.steps,
+                   repair_cycles=state.repair_cycles, events_dropped=0)
+        state.event_sink = None
+        return None
+
+    def wrap_model(self, model):
+        return RecordingModel(model, self)
+
+    def wrap_registry(self, registry):
+        return RecordingRegistry(registry, self)
+
+
 class RecordingModel:
     """Records one start/finish event per model call; never records prompts or outputs."""
 
@@ -200,7 +248,7 @@ class RecordingRegistry:
 
     def _record(self, name: str, arguments, run):
         from harness.model.types import ToolCall
-        from harness.orchestrator.observe import summarize_arguments
+        from harness.orchestrator.observe import short_result, summarize_arguments
         summary = summarize_arguments(ToolCall("-", name, dict(arguments or {})))
         self.recorder.event("tool_call_started", tool=name, arguments=summary)
         result = run()
@@ -210,6 +258,10 @@ class RecordingRegistry:
         data = result.data
         if data is not None and hasattr(data, "exit_code") and hasattr(data, "timed_out"):
             meta.update(exit_code=data.exit_code, timed_out=data.timed_out)
+        if result.success:
+            detail = short_result(data)
+            if detail:
+                meta["detail"] = detail
         self.recorder.event("tool_call_completed", **meta)
         return result
 
@@ -326,6 +378,7 @@ def list_runs(runs_dir: Path, limit: int = 20) -> list[dict]:
         except (OSError, json.JSONDecodeError):
             continue
         rows.append({"run_id": data.get("run_id", summary_path.parent.name), "final_status": data.get("final_status"),
-                     "started_at": data.get("started_at") or "", "task": (data.get("task") or "").strip().splitlines()[:1]})
+                     "started_at": data.get("started_at") or "", "task": (data.get("task") or "").strip().splitlines()[:1],
+                     "repository": (data.get("repository") or {}).get("root")})
     rows.sort(key=lambda r: (r["started_at"], r["run_id"]), reverse=True)
     return rows[:limit]

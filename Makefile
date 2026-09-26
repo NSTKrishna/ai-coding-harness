@@ -41,8 +41,10 @@ setup:
 $(STAMP):
 	@$(MAKE) --no-print-directory setup
 
+# Exit 130 means the user cancelled (Ctrl-C / declined); the harness already printed why,
+# so make should not add "Error 130". Every other exit code is passed through unchanged.
 run: $(STAMP)
-	@$(PY) -m harness run $(ARGS)
+	@$(PY) -m harness run $(ARGS); status=$$?; if [ $$status -eq 130 ]; then exit 0; fi; exit $$status
 
 test: $(STAMP)
 	$(PY) -m unittest discover -s tests -t . -v

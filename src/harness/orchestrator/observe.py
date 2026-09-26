@@ -57,6 +57,38 @@ def summarize_arguments(call: ToolCall) -> str:
     return text if len(text) <= MAX_ARGUMENT_SUMMARY else text[: MAX_ARGUMENT_SUMMARY - 3] + "..."
 
 
+def short_result(data: Any) -> str:
+    """One bounded, human-readable line summarizing a tool's structured result data.
+
+    Presentation only (used by the live UI's tool-activity line); never affects
+    what ``observe()`` records as evidence.
+    """
+    if isinstance(data, CommandResult):
+        state = "timed out" if data.timed_out else f"exit {data.exit_code}"
+        return state
+    if isinstance(data, PatchResult):
+        if len(data.files) == 1:
+            return f"+{data.files[0].added} -{data.files[0].removed}"
+        shown = data.files[:3]
+        text = ", ".join(f"{f.path} +{f.added} -{f.removed}" for f in shown)
+        if len(data.files) > len(shown):
+            text += f", +{len(data.files) - len(shown)} more file(s)"
+        return text
+    if isinstance(data, SearchResult):
+        return f"{len(data.matches)} match(es)" + (" (truncated)" if data.truncated else "")
+    if isinstance(data, FileContent):
+        return f"{data.total_lines} line(s)"
+    if isinstance(data, FileList):
+        return f"{len(data.entries)} entr{'y' if len(data.entries) == 1 else 'ies'}"
+    if isinstance(data, GitStatus):
+        return "clean" if data.clean else f"{len(data.entries)} change(s)"
+    if isinstance(data, GitDiffStat):
+        return data.summary
+    if isinstance(data, GitDiff):
+        return f"{len(data.text.splitlines())} line(s)" if data.text else "no changes"
+    return ""
+
+
 def observe(step: int, call: ToolCall, result: ToolResult, max_chars: int) -> Observation:
     args = summarize_arguments(call)
     if not result.success:
