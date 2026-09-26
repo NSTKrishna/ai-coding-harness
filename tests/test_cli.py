@@ -39,24 +39,31 @@ class CliTestCase(unittest.TestCase):
         self.assertNotIn(FAKE_KEY, err)
         return code, out, err
 
+    def assert_input_accepted(self, code, out, err):
+        """Input is accepted and reported; execution then stops because this build has no
+        live model adapter (M4). Nothing is claimed to have run."""
+        self.assertIn("Input accepted.", out, err)
+        self.assertEqual(code, EXIT_USAGE, err)
+        self.assertIn("No model provider is configured", err)
+        self.assertIn("No model was called and the repository was not modified.", err)
+
 
 class RunArgumentsTest(CliTestCase):
     def test_repo_and_task_arguments(self):
         code, out, err = self.run_cli(["run", "--repo", str(self.repo), "--task", "Fix the parser bug"])
-        self.assertEqual(code, EXIT_OK, err)
+        self.assert_input_accepted(code, out, err)
         self.assertIn("Configuration accepted.", out)
         self.assertIn("API key:         set (redacted)", out)
         self.assertIn(str(self.repo.resolve()), out)
         self.assertIn("Task source:     argument", out)
         self.assertIn("Fix the parser bug", out)
-        self.assertIn("not implemented yet", out)
         self.assertNotIn("Repository path:", out)
 
     def test_task_file_argument(self):
         task_file = self.tmp / "issue.md"
         task_file.write_text("Title line\n\nBody line\n", encoding="utf-8")
         code, out, err = self.run_cli(["run", "--repo", str(self.repo), "--task-file", str(task_file)])
-        self.assertEqual(code, EXIT_OK, err)
+        self.assert_input_accepted(code, out, err)
         self.assertIn(f"Task source:     file {task_file}", out)
         self.assertIn("Title line (3 line(s)", out)
 
@@ -108,19 +115,19 @@ class RunArgumentsTest(CliTestCase):
 
     def test_api_key_in_task_text_is_redacted(self):
         code, out, err = self.run_cli(["run", "--repo", str(self.repo), "--task", f"leak {FAKE_KEY}"])
-        self.assertEqual(code, EXIT_OK, err)
+        self.assert_input_accepted(code, out, err)
         self.assertIn("leak ***", out)
 
     @unittest.skipUnless(shutil.which("git"), "git not installed")
     def test_reports_git_repository(self):
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         code, out, err = self.run_cli(["run", "--repo", str(self.repo), "--task", "x"])
-        self.assertEqual(code, EXIT_OK, err)
+        self.assert_input_accepted(code, out, err)
         self.assertIn("(git repository)", out)
 
     def test_reports_non_git_directory(self):
         code, out, err = self.run_cli(["run", "--repo", str(self.repo), "--task", "x"])
-        self.assertEqual(code, EXIT_OK, err)
+        self.assert_input_accepted(code, out, err)
         self.assertIn("not a git repository", out)
 
 
@@ -128,7 +135,7 @@ class InteractiveTest(CliTestCase):
     def test_prompts_for_repo_and_multiline_task(self):
         stdin_text = f"{self.repo}\nFirst line of issue\nSecond line\n\nignored after blank\n"
         code, out, err = self.run_cli(["run"], stdin_text=stdin_text)
-        self.assertEqual(code, EXIT_OK, err)
+        self.assert_input_accepted(code, out, err)
         self.assertIn("Repository path: ", out)
         self.assertIn("Task / GitHub issue", out)
         self.assertIn("Task source:     prompt", out)
@@ -136,7 +143,7 @@ class InteractiveTest(CliTestCase):
 
     def test_prompts_only_for_what_is_missing(self):
         code, out, err = self.run_cli(["run", "--repo", str(self.repo)], stdin_text="Do the thing\n")
-        self.assertEqual(code, EXIT_OK, err)
+        self.assert_input_accepted(code, out, err)
         self.assertNotIn("Repository path:", out)
         self.assertIn("Task / GitHub issue", out)
 
@@ -179,19 +186,61 @@ class ModuleEntryPointTest(CliTestCase):
     def test_run_with_arguments(self):
         result = self.run_module("run", "--repo", str(self.repo), "--task", "x",
                                  env_overrides={"AI_API_KEY": FAKE_KEY})
-        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
-        self.assertIn("Harness skeleton ready.", result.stdout)
+        self.assertEqual(result.returncode, EXIT_USAGE, result.stderr)
+        self.assertIn("Input accepted.", result.stdout)
+        self.assertIn("No model provider is configured", result.stderr)
 
     def test_run_interactive_via_stdin(self):
         result = self.run_module("run", env_overrides={"AI_API_KEY": FAKE_KEY},
                                  stdin_text=f"{self.repo}\nFix it\n\n")
-        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertEqual(result.returncode, EXIT_USAGE, result.stderr)
         self.assertIn("Task source:     prompt", result.stdout)
+        self.assertIn("No model provider is configured", result.stderr)
 
     def test_run_without_api_key(self):
         result = self.run_module("run", "--repo", str(self.repo), "--task", "x")
         self.assertEqual(result.returncode, EXIT_USAGE)
         self.assertIn("AI_API_KEY is not set", result.stderr)
+
+
+class RunExecutionTest(CliTestCase):
+    """`harness run` with a model injected in place of the (absent) live adapter."""
+
+    def setUp(self):
+        super().setUp()
+        from tests.orchestration_helpers import FIX_PATCH, buggy_repo, complete, plan_response, tool
+        self.repo = buggy_repo(self.tmp)
+        self.script = [plan_response(), tool("apply_patch", patch=FIX_PATCH), complete("fixed add_one")]
+
+    def run_with_model(self, script, provider="acme"):
+        from unittest import mock
+        from harness.model import ScriptedModel
+        with mock.patch("harness.model.factory.create_model_client", return_value=ScriptedModel(script)):
+            return self.run_cli(["run", "--repo", str(self.repo), "--task", "Fix add_one"],
+                                environ={"AI_API_KEY": FAKE_KEY, "AI_MODEL_PROVIDER": provider})
+
+    def test_run_reaches_ready_for_verification_without_claiming_success(self):
+        code, out, err = self.run_with_model(self.script)
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("READY_FOR_VERIFICATION", out)
+        self.assertIn("the changes have NOT been verified yet", out)
+        self.assertIn("Modified files: src/math_utils.py", out)
+        self.assertNotIn("VERIFIED\n", out)
+
+    def test_incomplete_run_exit_code(self):
+        from harness.model import text_response
+        code, out, _ = self.run_with_model([text_response("not a plan")])
+        self.assertEqual(code, 1)
+        self.assertIn("MODEL_ERROR", out)
+        self.assertIn("invalid_plan", out)
+
+    def test_unsupported_provider_is_reported_precisely(self):
+        code, out, err = self.run_cli(["run", "--repo", str(self.repo), "--task", "Fix add_one"],
+                                      environ={"AI_API_KEY": FAKE_KEY, "AI_MODEL_PROVIDER": "acme"})
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("Configured model provider is not supported by this build: 'acme'", err)
+        self.assertIn("harness inspect", err)
+        self.assertIn("return x + 2", (self.repo / "src" / "math_utils.py").read_text())
 
 
 if __name__ == "__main__":

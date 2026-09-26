@@ -9,14 +9,27 @@ Status:
 
 ## R1 — Autonomous software engineering harness
 
-- [~] Accept software engineering task
-- [ ] Understand task
-- [~] Inspect existing repository
-- [~] Determine relevant files
-- [ ] Modify implementation
+- [x] Accept software engineering task
+- [~] Understand task
+- [x] Inspect existing repository
+- [x] Determine relevant files
+- [~] Modify implementation
 - [ ] Verify modifications
 
-Evidence:
+Evidence (M4, 2026-09-26):
+- The task now flows through the run: `Orchestrator.run(repo, task)` goes INTAKE → DISCOVER
+  (M3 discovery on the run's `ToolContext`) → PLAN → EXECUTE → `READY_FOR_VERIFICATION`
+  (tests/test_orchestrator.py, 31 tests). Inspecting the repository and determining relevant
+  files are now part of every run, not standalone components.
+- Understand task: partial. The planner produces a validated `TaskPlan` (understanding,
+  acceptance criteria, steps) from bounded context, but only scripted model output has been
+  parsed; no live model exists.
+- Modify implementation: partial. `ReadPatchIntegrationTest` reads, patches and completes
+  with ScriptedModel: `src/math_utils.py` is changed, recorded in `modified_files`, and the
+  stale context is invalidated. No live model has produced a patch.
+- Verify: still missing. `complete` only reaches `READY_FOR_VERIFICATION`, never `VERIFIED`.
+
+Evidence (M3):
 - M3 (2026-09-26): `RepositoryAnalyzer` profiles a repository and `discover_for_task` ranks
   relevant files with reasons (tests/test_repo_profile.py, tests/test_discovery.py; `harness
   inspect` on Python/TS/Go/303-file fixtures). Partial: these components are verified on their
@@ -31,7 +44,7 @@ Evidence:
 ## R2 — Repository navigation
 
 - [x] Repository analyzer exists
-- [~] Uses deterministic search before model calls
+- [x] Uses deterministic search before model calls
 - [x] Supports targeted file discovery
 - [x] Does not blindly load entire repository
 
@@ -48,9 +61,10 @@ Evidence (M3, 2026-09-26):
   anchored task reads 2 config + 1 candidate files, and the test asserts at most 8 candidate
   reads and under 5% of files read in total (`test_discovery_reads_few_files`). The working set is
   bounded by `ContextLimits` (tests/test_working_set.py).
-- Search before model calls: partial. Discovery is deterministic and needs no model or API key
-  (`test_no_api_key_needed`, `inspect` run with the key unset), but the orchestrator that runs it
-  before the first model call does not exist yet (M4).
+- Search before model calls (M4): `WiringTest.test_discovery_runs_before_first_model_call_and_shares_the_tool_context`
+  records the order `["discover", "plan"]`, and the planner request contains the working set.
+  The M4 trace shows `discover_for_task -> model:plan -> model:step1 …`. Discovery needs no model
+  or API key.
 
 Evidence (M2):
 - M2 (2026-09-26): primitives only. `find_files` (glob) and `search_text` (ripgrep with an
@@ -62,15 +76,25 @@ Evidence (M2):
 
 ## R3 — Orchestration
 
-- [ ] Explicit execution lifecycle exists
-- [ ] Plan
-- [ ] Execute
+- [x] Explicit execution lifecycle exists
+- [x] Plan
+- [x] Execute
 - [ ] Verify
 - [ ] Repair
-- [ ] Finish/terminate
+- [~] Finish/terminate
 
-Evidence:
-TBD
+Evidence (M4, 2026-09-26):
+- Lifecycle: `Phase` enum with an enforced transition table; invalid moves raise
+  `InvalidTransition`; VERIFYING/VERIFIED/NEEDS_REPAIR are unreachable in M4
+  (tests/test_run_state.py, 9 tests).
+- Plan: strict JSON `TaskPlan`, validated and never filled in (tests/test_planner.py, 6 tests with
+  13 rejection cases; malformed plans end in MODEL_ERROR/`invalid_plan`).
+- Execute: one action per model call, observations feed the next request
+  (`test_one_action_per_model_call`, `test_each_observation_feeds_the_next_request`).
+- Finish/terminate: partial. Every run ends in a terminal phase with a structured reason, with no
+  traceback escaping (malformed output, model errors, tool crashes, budgets, invalid input all
+  tested). A verified finish does not exist until M5.
+- Verify, Repair: not implemented (M5).
 
 ---
 
@@ -80,6 +104,13 @@ TBD
 - [x] Relevant files/snippets selected
 - [ ] Old observations can be summarized/compacted
 - [~] Repeated unnecessary context avoided
+
+Evidence (M4, 2026-09-26):
+- Executor requests are rebuilt from bounded windows each step (6 observations, 20 history
+  lines) instead of resending the whole conversation. Request size stops growing once the
+  windows fill (`test_execution_requests_stay_bounded`). Stale pre-edit content is replaced by a
+  re-read marker and the file's working-set evidence is removed after a patch. Still partial:
+  no compaction/summarization and no "unchanged since" re-read marker.
 
 Evidence (M3, 2026-09-26):
 - `ContextManager` (src/harness/context/manager.py): permanent (task, repo summary; never
@@ -102,8 +133,15 @@ Evidence (M3, 2026-09-26):
 - [x] Search repository
 - [x] Apply patch
 - [x] Execute command
-- [~] Run tests
+- [x] Run tests
 - [x] Inspect git diff
+
+Evidence (M4, 2026-09-26): all tools are now driven by the executor through
+`ToolRegistry.dispatch_call` in end-to-end ScriptedModel runs. Run tests: discovered test
+commands (with resolved interpreters) are offered to the planner, and the executor runs
+`run_tests`. A failing suite is recorded as `success=True, outcome="command_failed", exit_code=1`
+with the assertion excerpt (`CommandObservationTest`). Deciding *when* tests prove the task
+is verification (R7), not this item.
 
 Evidence (M2, 2026-09-26) — tool primitives, verified in isolation; nothing drives them
 autonomously yet (the agent loop is M3):
@@ -126,14 +164,19 @@ autonomously yet (the agent loop is M3):
 
 ## R6 — Failure recovery
 
-- [ ] Failed test detected
+- [~] Failed test detected
 - [ ] Failure classified
 - [ ] Repair/replan path exists
 - [ ] Retry limit exists
-- [ ] Infinite loops prevented
+- [~] Infinite loops prevented
 
-Evidence:
-TBD
+Evidence (M4, 2026-09-26) — bounded termination only, no recovery:
+- Failed test detected: partial. A failing test command is recorded as a structured observation
+  (`outcome="command_failed"`, exit code, stderr excerpt), but nothing acts on it.
+- Infinite loops prevented: partial. The executor loop is bounded by `max_steps`,
+  `max_model_calls` and `max_tool_calls`, checked before the operation, with exact counts tested
+  (`BudgetTest`, 7 tests). No repair loop exists yet to bound, and `max_repair_cycles` is unused.
+- Classification, repair/replan and retry limits: not implemented (M5).
 
 ---
 
@@ -146,7 +189,8 @@ TBD
 - [ ] Failed verification triggers repair
 
 Evidence:
-TBD
+- None yet. M4 deliberately stops at `READY_FOR_VERIFICATION`. The executor *can* run tests
+  and git inspection as tools, but no verification engine decides anything from them (M5).
 
 ---
 
@@ -154,9 +198,23 @@ TBD
 
 - [x] Model calls tracked
 - [x] Tool calls tracked
-- [~] Context usage controlled
+- [x] Context usage controlled
 - [ ] Targeted tests before full suite
 - [~] Expensive operations avoided when unnecessary
+
+Evidence (M4, 2026-09-26):
+- Budgets enforced before the operation that would exceed them, exact counts asserted:
+  `max_steps=3` → 3 steps, 4 model calls, 3 tool calls; `max_model_calls=3` → exactly 3 model calls;
+  `max_tool_calls=2` → exactly 2 dispatches (the third chosen tool is not run);
+  `max_model_calls=1` → planner only; `max_model_calls=0` → no call at all; no extra model call to
+  announce exhaustion (tests/test_orchestrator.py `BudgetTest`, M4 trace).
+- Counts are authoritative: one `ExecutionMetrics` shared by `MeteredModelClient`, `ToolRegistry`
+  and `RunState` (`test_counts_come_from_shared_metrics`, `WiringTest`).
+- Context usage controlled: the planner gets the bounded working set (204-file repository → 1,501-char
+  planner message; `test_planner_receives_bounded_working_set_not_the_repository` with a
+  3,000-char limit), and executor requests are windowed and stop growing
+  (`test_execution_requests_stay_bounded`).
+- Command timeout wired from configuration (`test_command_timeout_comes_from_configuration`).
 
 Evidence (M3, 2026-09-26):
 - `DiscoveryMetrics` report inventory size, content searches, files matched, files read
@@ -196,7 +254,9 @@ Evidence (M1, 2026-09-26):
 - Fresh copy, Python 3.12 with `PIP_NO_INDEX=1` (simulated offline): setup=0 (warns that the
   console script is unavailable) test=0 run=0 clean=0.
 - `make run` partial: launches interactively (verified through a real pty) and validates
-  config/input, but the agent itself is not implemented yet.
+  config/input. M4: it then stops with "No model provider is configured …" or "Configured model
+  provider is not supported by this build …" (exit 2, nothing modified), because no live adapter
+  exists. The run path behind it is tested with an injected model (`RunExecutionTest`).
 - M2 fix (2026-09-26): `make test` had started failing because Python 3.14 skipped the venv's
   `.pth` files after macOS set the "hidden" flag on `.venv`. Targets now set `PYTHONPATH=src`.
   Re-verified: `make clean && make setup && make test` → 0/0/0.
@@ -208,6 +268,11 @@ Evidence (M1, 2026-09-26):
 - [x] reads AI_API_KEY
 - [x] no hardcoded credentials
 - [x] .env.example contains no real credential
+
+Evidence (M4, 2026-09-26, additional):
+- ScriptedModel runs need no key (`AI_API_KEY` removed in `OrchestratorCase`). With a fake key set
+  in the environment, it appears nowhere in RunState, its summary or any model request (M4
+  trace), nor in `make run` output. The run's redactor also covers model-provided summaries.
 
 Evidence (M3, 2026-09-26, additional):
 - `harness inspect` and `discover_for_task` never load the key (tests/test_inspect_cli.py,
@@ -237,6 +302,11 @@ Evidence (M1, 2026-09-26):
 - [~] text-only
 - [~] model configurable
 - [x] provider abstraction exists
+
+Evidence (M4, 2026-09-26):
+- `model/factory.create_model_client` is the single construction boundary; it fails explicitly for
+  an unset or unsupported provider and ships no adapter (tests/test_model_factory.py). The
+  orchestrator depends only on `ModelClient`. Still partial: no live model.
 
 Evidence (M2, 2026-09-26):
 - `ModelClient.generate(ModelRequest) -> ModelResponse` with provider-neutral frozen dataclasses
@@ -269,6 +339,8 @@ Evidence (M1, 2026-09-26):
   on Python 3.12 with `PIP_NO_INDEX=1`, and with ripgrep absent from PATH.
 - M3 (2026-09-26): same three fresh-copy runs with 234 tests: all pass (2 ripgrep-only tests
   skipped without ripgrep). Still no runtime dependencies.
+- M4 (2026-09-26): same runs with 303 tests: all pass on Python 3.10.19, offline 3.12, and
+  without ripgrep (2 skipped).
 
 ---
 

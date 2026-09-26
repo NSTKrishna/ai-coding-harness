@@ -9,7 +9,7 @@
 > architecture is intentionally revised. Revisions are deliberate edits to this
 > file, recorded in PROGRESS.md.
 
-Status markers used below: **[M1]**/**[M2]**/**[M3]** built in that milestone, **[planned]** designed but not built.
+Status markers used below: **[M1]**…**[M4]** built in that milestone, **[planned]** designed but not built.
 What is actually implemented and verified is tracked in PROGRESS.md and REQUIREMENTS.md, not here.
 
 ---
@@ -113,13 +113,13 @@ Software Engineering Task
 |---|---|---|
 | CLI | `harness/cli.py` **[M1]** | Parse arguments or prompt for input; build `TaskSpec`; start a run; exit codes |
 | Config | `harness/config.py` **[M1]** | Load and validate settings; hold the secret without exposing it |
-| Orchestrator | `harness/orchestrator/machine.py` | Drive the lifecycle state machine; enforce budgets |
-| RunState | `harness/orchestrator/state.py` | Single source of run state; serializable |
+| Orchestrator | `harness/orchestrator/orchestrator.py` **[M4]** | Coordinate INTAKE → DISCOVER → PLAN → EXECUTE; share one ToolContext |
+| RunState | `harness/orchestrator/state.py` **[M4]** | Single source of run state; enforced phase transitions |
 | Repository intelligence | `harness/repo/` **[M3]** | Inventory, profile, command discovery, task signals, candidate ranking |
 | Context manager | `harness/context/` **[M3]** | Bounded working set; permanent/working/episodic stores (compaction planned) |
 | Model client | `harness/model/` **[M2]** | Provider-independent `generate()`; scripted fake model; call metering (adapters planned) |
-| Planner | `harness/orchestrator/planner.py` | Produce and revise a structured `Plan` |
-| Executor | `harness/orchestrator/executor.py` | Run plan steps as model-action → tool → observation loops |
+| Planner | `harness/orchestrator/plan.py` **[M4]** | One model call → strict JSON `TaskPlan` (revision planned) |
+| Executor | `harness/orchestrator/executor.py` **[M4]** | Bounded one-action-per-step model → tool → observation loop |
 | Tool registry | `harness/tools/` **[M2]** | Validated, confined, counted tool execution |
 | Verification engine | `harness/verify/verifier.py` | Decide PASS/FAIL/INCONCLUSIVE from evidence |
 | Evidence ledger | `harness/verify/ledger.py` | Append-only record of what was observed |
@@ -136,82 +136,91 @@ return results.
 
 # 4. Agent lifecycle / state machine
 
+**Built in M4** (`orchestrator/state.py`, `orchestrator/orchestrator.py`):
+
 ```text
- INIT ──▶ UNDERSTAND ──▶ DISCOVER ──▶ PLAN ──▶ EXECUTE ──▶ VERIFY ──pass──▶ SUCCEEDED
-                             ▲          ▲         ▲           │
-                             │          │         │         fail
-                             │          │         │           ▼
-                             │          └─replan──┴──fix── REPAIR
-                             └──────need more context────────┘
-                                                             │
-                                    budget exhausted / loop  │
-                                    detected / unrecoverable ▼
-                                                           FAILED
-
- any state ──fatal error / interrupt──▶ ABORTED
+ INTAKE ──▶ DISCOVER ──▶ PLAN ──▶ EXECUTE ──complete──▶ READY_FOR_VERIFICATION
+   │            │          │         │
+   │            │          │         ├─blocked──────────▶ BLOCKED
+   │            │          │         ├─model/protocol───▶ MODEL_ERROR
+   │            │          │         ├─tool crash───────▶ TOOL_ERROR
+   │            │          ├─────────┴─budget───────────▶ BUDGET_EXHAUSTED
+   │            │          └─bad plan / model failure───▶ MODEL_ERROR
+   ├─invalid input──────────────────────────────────────▶ BLOCKED
+   └────────────┴─ unexpected exception ────────────────▶ INTERNAL_ERROR
 ```
 
-| State | Does | Exits to |
+| Phase | Does | Exits to |
 |---|---|---|
-| `INIT` | Validate config, repo path, task; create run directory; snapshot `git status` | `UNDERSTAND`, or `ABORTED` on invalid input |
-| `UNDERSTAND` | Extract goal, acceptance criteria, identifiers, file paths, error text from the task | `DISCOVER` |
-| `DISCOVER` | Build `RepoProfile`, rank candidate files, detect test command, run **baseline** tests | `PLAN` |
-| `PLAN` | Model produces a `Plan` from permanent context + top candidates (read-only tools allowed) | `EXECUTE` |
-| `EXECUTE` | Execute the current plan step via the executor loop; apply patches | `EXECUTE` (next step) or `VERIFY` |
-| `VERIFY` | Run the verification engine (§14) | `SUCCEEDED` or `REPAIR` |
-| `REPAIR` | Classify the failure (§16) and choose: fix in place, replan, or rediscover | `EXECUTE`, `PLAN`, `DISCOVER`, or `FAILED` |
-| `SUCCEEDED` | Terminal. Write run report with evidence | — |
-| `FAILED` | Terminal. Write run report explaining why, with evidence gathered | — |
-| `ABORTED` | Terminal. Fatal environment/config error or user interrupt | — |
+| `INTAKE` | Check task non-empty, create the run's single `ToolContext` (root, limits, metrics) | `DISCOVER`, `BLOCKED` |
+| `DISCOVER` | M3 `discover_for_task(..., ctx=ctx)`; resolve Python interpreters of discovered commands (§6) | `PLAN` |
+| `PLAN` | Budget check, then one planner model call → `TaskPlan` (§10) | `EXECUTE`, `MODEL_ERROR`, `BUDGET_EXHAUSTED` |
+| `EXECUTE` | Executor loop (§12) | `READY_FOR_VERIFICATION` or an abnormal terminal |
+| `READY_FOR_VERIFICATION` | Terminal in M4. The executor *believes* it is done; nothing has been verified | — (M5: → `VERIFYING`) |
+| `BLOCKED`, `MODEL_ERROR`, `TOOL_ERROR`, `BUDGET_EXHAUSTED`, `INTERNAL_ERROR` | Terminal, with a structured `Failure(kind, message, details)` | — |
 
-Loop shape:
+`RunState.transition()` enforces the table; any other move raises
+`InvalidTransition`. `VERIFYING`, `VERIFIED` and `NEEDS_REPAIR` exist in the
+enum for M5, but no M4 transition reaches them. The orchestrator catches every
+exception, so a run always ends in a terminal phase instead of a traceback.
 
-```python
-while state.phase not in TERMINAL:
-    if budget.exhausted(state):
-        state.transition(FAILED, reason=budget.reason)
-        break
-    handler = HANDLERS[state.phase]
-    transition = handler(state)          # returns next phase + reason
-    telemetry.record_transition(state.phase, transition)
-    state.apply(transition)
+**Target lifecycle (M5+) [planned]:**
+
+```text
+ … EXECUTE ──▶ READY_FOR_VERIFICATION ──▶ VERIFYING ──pass──▶ VERIFIED
+                    ▲                          │
+                    └──── fix / replan ── NEEDS_REPAIR ◀──fail─┘
 ```
 
-Each handler is a plain function `RunState -> Transition`, which makes each
-state unit-testable in isolation.
+`VERIFYING` runs the verification engine (§14). `NEEDS_REPAIR` classifies the
+failure (§16) and re-enters `EXECUTE` or `PLAN` within `max_repair_cycles`. A
+baseline test run before editing is also planned for DISCOVER/M5.
 
 ---
 
 # 5. RunState
 
+**[M4]** `orchestrator/state.py`, a mutable dataclass owned by the orchestrator:
+
 ```python
-@dataclass
-class RunState:
-    run_id: str
-    phase: Phase
-    task: TaskSpec                    # raw text, source (arg/file/prompt), criteria
-    repo: RepoProfile | None          # filled in DISCOVER
-    plan: Plan | None                 # filled in PLAN, revised on replan
-    current_step: int
-    patches: list[PatchRecord]        # applied edits + pre-edit snapshots
-    baseline: TestRunSummary | None   # tests before any edit
-    last_failure: FailureReport | None
-    failure_signatures: list[str]     # for loop detection
-    repair_cycles: int
-    context: ContextStore
-    ledger: EvidenceLedger
-    budget: BudgetTracker
-    transitions: list[TransitionRecord]
-    outcome: Outcome | None           # SUCCEEDED / FAILED / ABORTED + reason
+RunState(
+    run_id, task, repo_root, phase,
+    discovery: DiscoveryResult,        # repo_profile / working_set are views of it
+    plan: TaskPlan,
+    observations: list[Observation],   # bounded (max_observations, oldest dropped, counted)
+    action_history: list[ActionRecord],# step, kind, tool, argument summary, native|text
+    modified_files: list[str],         # unique, in order
+    steps: int,                        # executor iterations
+    failure: Failure | None,           # kind, message, details
+    terminal_reason: str | None,
+    transitions: list[Transition],     # source, target, reason, seconds since start
+    metrics: ExecutionMetrics,         # the run's shared counters (model/tool/command calls)
+    started_at, elapsed_seconds,
+)
+Observation(step, tool, arguments_summary, success, outcome, result_summary,
+            affected_paths, exit_code, timed_out, error_code, stale)
 ```
 
 Rules:
 
-- The orchestrator is the only writer of `phase`, `outcome` and `transitions`.
-- `RunState` is JSON-serializable (via `dataclasses.asdict` plus small encoders)
-  and written to the run directory at every transition, so a failed run can be
-  inspected after the fact.
-- It never contains the API key.
+- **Single source of truth.** `model_calls`/`tool_calls` are properties reading the
+  shared `ExecutionMetrics` that `MeteredModelClient` and `ToolRegistry` update.
+  RunState keeps no second counter. The planner, executor and context manager
+  hold no copy of run state.
+- **Facts only.** Observations record tool, bounded argument summary, tool
+  success, outcome (`ok`, `tool_error`, `command_ok`, `command_failed`,
+  `command_timed_out`), a bounded excerpt, affected paths, exit code and timeout.
+  No model reasoning is stored. The only model text kept is the
+  `complete`/`blocked` summary the protocol asks for (≤ 500 characters).
+- **Staleness.** `invalidate_path(path, before_step)` marks earlier observations
+  of a patched file stale; stale observations are rendered as a "read it again"
+  marker, never as content.
+- `summary()` returns a frozen `RunSummary` (status, reason, failure, plan,
+  modified files, counts, recent observations). There is deliberately no
+  verification field.
+- It never contains the API key: tool results pass through the registry
+  redactor, and model summaries through the same redactor.
+- **[planned]** JSON serialization to the run directory at every transition (§19).
 
 ---
 
@@ -436,14 +445,15 @@ ModelError(message, retryable: bool)                     # adapters raise this
   types. No provider object crosses the adapter boundary. The API key is never
   part of these types; an adapter receives it when constructed.
 - **Tool calls, two routes.** If the prescribed model supports native tool
-  calling, its adapter maps it to `ToolCall`. If not, the executor [planned]
-  asks for the text action protocol below and parses it into the same
-  `ToolCall`. Either way the executor sees one shape. Malformed arguments are
+  calling, its adapter maps it to `ToolCall`. If not, the executor **[M4]**
+  parses the text action protocol below into the same `ToolCall`. Either way the executor sees one shape. Malformed arguments are
   represented (`parse_error`), not raised, and the registry turns them into a
   structured `invalid_arguments` result.
-- **Adapters [planned].** One per provider, selected by `config.model.provider`.
-  None exists yet: the organizers have not announced the provider, model or
-  endpoint, and none is assumed. Adapters will use `urllib.request` (no SDK).
+- **Adapters.** **[M4]** `model/factory.create_model_client(settings, api_key)`
+  selects a constructor from `ADAPTERS` by `config.model.provider` and raises
+  `UnsupportedProviderError` for an unset or unknown provider. `ADAPTERS` is
+  empty: the organizers have not announced the provider, model or endpoint, and
+  none is assumed. **[planned]** Adapters will use `urllib.request` (no SDK).
 - **Fake model [M2].** `ScriptedModel` returns queued items in order: a
   `ModelResponse`, an exception to raise, or a callable building a response from
   the request. It records every request (`requests`, `call_count`), raises
@@ -456,42 +466,62 @@ ModelError(message, retryable: bool)                     # adapters raise this
 - **Transient errors [planned].** Timeouts, HTTP 429 and 5xx are retried with
   exponential backoff up to a limit; every attempt counts as a model call.
 
-**Action protocol [planned].** For models without native tool calling, each
-executor turn the model replies with exactly one JSON object in a fenced block:
+**Action protocol [M4]** (`orchestrator/protocol.py`). Each executor step, the
+model's whole reply is exactly one JSON object (optionally one code fence that is
+the entire reply; no other markdown or prose is parsed):
 
 ```json
-{"thought": "short reasoning", "action": "read_range", "args": {"path": "src/x.py", "start_line": 1, "end_line": 80}}
+{"action": "tool", "tool": "read_range", "arguments": {"path": "src/x.py", "start_line": 1, "end_line": 80}}
+{"action": "complete", "summary": "what was changed"}
+{"action": "blocked", "reason": "why work cannot continue"}
 ```
 
-Special actions: `step_done`, `request_replan`, `finish` (a claim that verification
-should run; not a success declaration). A reply that does not parse gets one
-format-correction reprompt, counted as `MODEL_FORMAT_ERROR` if it recurs.
-
+Exactly these keys are allowed per form; summaries and reasons are non-empty and
+at most 500 characters. A native tool call (`ModelResponse.tool_calls`) takes
+precedence over the text, and exactly one is allowed. Both routes yield the same
+`ToolCall` and go through `ToolRegistry.dispatch_call`. `complete` means only
+"the executor believes it is done" (→ `READY_FOR_VERIFICATION`). Anything else
+(prose, invalid JSON, unknown action, missing or extra fields) is a protocol
+error that ends the run (`MODEL_ERROR`, `invalid_action`). There is no automatic
+reprompt yet; **[planned]** one format-correction reprompt (§16).
 ---
 
 # 10. Planner
 
-Input: permanent context + L1 candidates + L2 snippets for the top candidates.
-Read-only tools are allowed while planning.
+**[M4]** `orchestrator/plan.py`. One model call; no tools; no retry.
 
-Output:
+Input (bounded): the system instructions; the task (capped at 8 000
+characters); the task signals; `WorkingSet.render()` from M3 (bounded by
+`ContextLimits`); and "Discovered commands", the M3 test/build/lint candidates
+with resolved interpreters, reasons and confidence, or an explicit "none". The
+planner never reads the repository itself. The request carries `PLAN_SCHEMA` as
+`response_schema` for providers with structured output, and plain-text JSON
+works for all others.
 
-```python
-@dataclass
-class Plan:
-    goal: str
-    acceptance_criteria: list[Criterion]   # from task + defaults below
-    steps: list[PlanStep]                  # intent, target files, how to verify
-    test_strategy: TestStrategy            # targeted tests, full-suite command
+Output: exactly one JSON object (optionally one whole-response code fence):
+
+```json
+{"understanding": "...", "acceptance_criteria": ["..."], "hypotheses": [],
+ "files_to_inspect": ["src/x.py"], "steps": [{"kind": "inspect|edit|test|other", "description": "..."}],
+ "verification_candidates": ["<a discovered command, copied exactly>"], "risks": []}
 ```
 
-Default criteria are added to every plan unless the task contradicts them:
-tests that passed at baseline still pass; the change is confined to relevant
-files; new behaviour is exercised by a test where the repo has tests.
+Validation rejects: non-JSON or surrounding prose, missing or extra fields, wrong
+types, empty `understanding`, no acceptance criteria, no steps, unknown step
+kinds, more than 20 items, strings over 300 characters (understanding over
+1 000), a tool call instead of JSON, and any verification candidate that the
+harness did not discover. An unresolved spelling shown in the repository
+summary (e.g. `python -m unittest …`) is accepted as an alias of the same
+discovered command. Rejection ends the run in `MODEL_ERROR` with
+`Failure(kind="invalid_plan")`; nothing is filled in or repaired.
 
-Replanning happens on `request_replan`, on repeated failure signatures (§16),
-or when repair determines the plan's file targets were wrong. A replan keeps the
-evidence ledger and the failure history so the model does not repeat itself.
+Result: `TaskPlan(understanding, acceptance_criteria, hypotheses, files_to_inspect,
+steps, verification_candidates: tuple[CommandCandidate], risks)`. When no command
+was discovered, `verification_candidates` is empty and the planner input says so.
+The verifier (M5) must handle that case.
+
+**[planned]** Replanning on `request_replan`, repeated failure signatures (§16) or
+wrong file targets, keeping evidence and failure history.
 
 ---
 
@@ -569,17 +599,43 @@ subdirectory of the work tree; results are limited to and relative to it.
 
 # 12. Executor
 
-Runs one plan step as a bounded loop:
+**[M4]** `orchestrator/executor.py`. A bounded DECIDE → ACT → OBSERVE → UPDATE loop.
 
 ```text
-assemble context ─▶ model.generate ─▶ parse action ─▶ registry.run(tool)
-        ▲                                                   │
-        └──────────── add observation to working context ◀──┘
+check budgets ─▶ build request ─▶ model.generate ─▶ parse_action ─▶ registry.dispatch_call ─▶ observe ─▶ update state
+      ▲                                                                                                    │
+      └────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The loop ends when the model emits `step_done`, `request_replan` or `finish`,
-or when the per-step turn limit is hit. Repeating an identical action with
-identical arguments three times in a row forces a `NO_PROGRESS` failure.
+- **One action per step.** Each iteration makes one model call and carries out at
+  most one action. More than one native tool call in a response is a protocol
+  error.
+- **Budgets, checked before the operation that would exceed them.** Before the
+  model call: `steps < max_steps` and `model_calls < max_model_calls`; before
+  dispatch: `tool_calls < max_tool_calls`. Exhaustion ends the run in
+  `BUDGET_EXHAUSTED` with `{budget, used, limit}` and makes no further model call.
+  The planner call counts toward `max_model_calls`.
+- **Actions.** `tool` → `ToolRegistry.dispatch_call` (the only way anything touches
+  the repository); `complete` → `READY_FOR_VERIFICATION`; `blocked` → `BLOCKED`.
+  Protocol violations → `MODEL_ERROR` (`invalid_action`); model call failures,
+  including unexpected adapter exceptions → `MODEL_ERROR` (`model_call_failed`).
+- **Tool results.** Every result becomes an `Observation`. Tool-level errors
+  (unknown tool, invalid or unparseable arguments, path outside repository,
+  blocked command, patch mismatch …) are observations and the loop continues.
+  Only `internal_error` (a tool crashed) ends the run in `TOOL_ERROR`. A command
+  that ran and failed is `success=True, outcome="command_failed"`, never a tool error.
+- **After a successful `apply_patch`:** record `modified_files`; mark earlier
+  observations of each changed file stale; `ContextManager.remove_source(path)`
+  drops that file's working-set evidence. The model must read the file again.
+- **Bounded request, rebuilt every step (no growing conversation):**
+  `ContextManager.render()` (capped task, repository summary, current evidence),
+  the plan, modified files, the last 20 action-history lines, the last 6
+  observations (each ≤ 4 000 chars; command output keeps its tail), remaining
+  budgets, and the tool list (also passed as `ModelRequest.tools` for native
+  tool calling). Request size stops growing once the windows fill (tested).
+  Window sizes are `ExecutorSettings`, not user configuration.
+- **[planned]** Detecting repeated identical actions (`NO_PROGRESS`), repair and
+  replanning (M5+).
 
 ---
 
@@ -688,10 +744,11 @@ the run.
 
 | Limit | Config key | Default |
 |---|---|---|
-| Orchestrator steps (state transitions + executor turns) | `max_steps` **[M1]** | 40 |
+| Executor steps (one model decision each) | `max_steps` **[M1]**, enforced **[M4]** | 40 |
 | Repair cycles | `max_repair_cycles` **[M1]** | 3 |
-| Command timeout (seconds) | `command_timeout_seconds` **[M1]**, enforced by the command tools **[M2]** | 300 |
-| Model calls | `max_model_calls` [planned] | 60 |
+| Command timeout (seconds) | `command_timeout_seconds` **[M1]**, enforced by the command tools **[M2]**, wired from config into the run's `ToolLimits` **[M4]** | 300 |
+| Model calls (planner + executor, failures included) | `max_model_calls` **[M4]** | 60 |
+| Tool calls (every dispatch) | `max_tool_calls` **[M4]** | 80 |
 | Context size (characters) | `max_context_chars` [planned] | 60 000 |
 | Per-tool output caps | `ToolLimits` **[M2]** (§11); not yet wired to configuration | see §11 |
 | Working-set files / candidates / evidence / snippet lines / chars | `ContextLimits` **[M3]** (§8, §21) | 8 / 25 / 24 / 30 / 24 000 |
@@ -772,9 +829,16 @@ harness inspect --repo PATH [--task TEXT | --task-file FILE] [--top N] [--show-c
   `Repository path:` then `Task / GitHub issue:`. The task prompt accepts
   multi-line input terminated by an empty line or end-of-input (so pasted issues work).
 - **[M1]** `--task` and `--task-file` are mutually exclusive.
-- **[M1]** In M1, after validation the CLI prints the accepted configuration
-  (secret redacted) and states that the agent is not implemented yet, then exits.
-  It does not call a model.
+- **[M4]** After validation the CLI prints the accepted configuration and input
+  (secret redacted), then asks `model/factory.create_model_client` for the
+  configured provider. `ADAPTERS` is empty in this build, so it stops with
+  "No model provider is configured …" or "Configured model provider is not
+  supported by this build: '<name>' …", states that no model was called and
+  the repository was not modified, points to `harness inspect`, and exits 2.
+  When an adapter exists, it runs the `Orchestrator` and prints the run
+  summary (terminal phase, meaning, counts, modified files, acceptance
+  criteria, verification candidates). It never claims verification.
+  ScriptedModel runs go through the orchestrator API in tests, not a CLI flag.
 - **[planned]** stdin task input, `make run` convenience variables, `--rollback-on-failure`,
   `--json` report output.
 
@@ -782,9 +846,9 @@ Exit codes:
 
 | Code | Meaning |
 |---|---|
-| 0 | Success (M1: input and configuration accepted) |
-| 1 | Run finished but verification failed [planned] |
-| 2 | Usage, configuration or input error |
+| 0 | Run reached `READY_FOR_VERIFICATION` (M4; not a verification verdict) |
+| 1 | Run ended in another terminal phase (M4); verification failed [planned M5] |
+| 2 | Usage, configuration or input error, including an unsupported/unset model provider |
 | 130 | Interrupted (Ctrl-C) |
 
 ---
@@ -804,6 +868,8 @@ already set in the environment.
 | `HARNESS_MAX_STEPS` | `limits.max_steps` | no | 40 |
 | `HARNESS_MAX_REPAIR_CYCLES` | `limits.max_repair_cycles` | no | 3 |
 | `HARNESS_COMMAND_TIMEOUT_SECONDS` | `limits.command_timeout_seconds` | no | 300 |
+| `HARNESS_MAX_MODEL_CALLS` | `limits.max_model_calls` **[M4]** | no | 60 |
+| `HARNESS_MAX_TOOL_CALLS` | `limits.max_tool_calls` **[M4]** | no | 80 |
 | `HARNESS_MAX_ACTIVE_FILES` | `context.max_active_files` **[M3]** | no | 8 |
 | `HARNESS_MAX_CANDIDATES` | `context.max_candidates` **[M3]** | no | 25 |
 | `HARNESS_MAX_EVIDENCE_ITEMS` | `context.max_evidence_items` **[M3]** | no | 24 |
@@ -842,13 +908,15 @@ from child-process environments (§25).
 │   ├── metrics.py            [M2] ExecutionMetrics
 │   ├── telemetry.py          [planned]
 │   ├── model/                [M2] types.py, client.py (ModelClient, MeteredModelClient), fake.py
+│   │                         [M4] factory.py (create_model_client; ADAPTERS empty)
 │   │   └── adapters/         [planned] one module per provider, once announced
 │   ├── tools/                [M2] base.py, registry.py, paths.py, files.py, search.py,
 │   │                              patch.py, commands.py, git.py
 │   ├── repo/                 [M3] classify.py, inventory.py, reader.py, facts.py, commands.py,
 │   │                              profile.py, signals.py, discovery.py, report.py
 │   ├── context/              [M3] working_set.py, manager.py   (compaction.py planned)
-│   ├── orchestrator/         [planned] state.py, machine.py, planner.py, executor.py, protocol.py
+│   ├── orchestrator/         [M4] state.py, protocol.py, plan.py, observe.py, executor.py,
+│   │                              interpreter.py, orchestrator.py, report.py
 │   └── verify/               [planned] verifier.py, ledger.py, failures.py
 └── tests/
     ├── test_config.py        [M1]
@@ -859,6 +927,9 @@ from child-process environments (§25).
     ├── repo_fixtures.py      [M3] Python/TS/Go/noisy/non-git/large miniature repositories
     ├── test_repo_inventory.py  test_repo_profile.py  test_task_signals.py  test_discovery.py   [M3]
     ├── test_working_set.py  test_context_manager.py  test_command_discovery.py  test_inspect_cli.py   [M3]
+    ├── orchestration_helpers.py  [M4] buggy repository + scripted responses
+    ├── test_run_state.py  test_planner.py  test_action_protocol.py  test_orchestrator.py   [M4]
+    ├── test_interpreter.py  test_model_factory.py   [M4]
     ├── fixtures/             [planned] templates for small target repositories
     └── e2e/                  [planned] full-loop tests with the fake model
 ```

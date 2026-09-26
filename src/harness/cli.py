@@ -20,7 +20,8 @@ from harness import __version__
 from harness.config import API_KEY_VAR, Config, ConfigError, load_config, load_context_limits
 
 EXIT_OK = 0
-EXIT_USAGE = 2
+EXIT_RUN_INCOMPLETE = 1     # the run ended without reaching READY_FOR_VERIFICATION
+EXIT_USAGE = 2              # usage, configuration (including an unsupported provider) or input error
 EXIT_INTERRUPTED = 130
 
 NOT_SET = "not set (awaiting organizer announcement)"
@@ -110,7 +111,33 @@ def main(
 
     stdout.write(config.redact(_report(config, task_input)))
     stdout.flush()
-    return EXIT_OK
+    return _execute(config, task_input, stdout, stderr)
+
+
+def _execute(config: Config, task_input: TaskInput, stdout: TextIO, stderr: TextIO) -> int:
+    """Model execution. Needs a live adapter for the configured provider; none exists in this build."""
+    from harness.model.factory import UnsupportedProviderError, create_model_client
+    from harness.orchestrator import Orchestrator, Phase
+    from harness.orchestrator.report import format_run
+
+    try:
+        model = create_model_client(config.model, config.api_key)
+    except UnsupportedProviderError as exc:
+        print(config.redact(
+            f"error: {exc}\nNo model was called and the repository was not modified. "
+            f"Deterministic analysis is available without a model: "
+            f"harness inspect --repo {task_input.repo} --task \"...\""), file=stderr)
+        return EXIT_USAGE
+
+    orchestrator = Orchestrator(model, limits=config.limits, context_limits=config.context, redact=config.redact)
+    try:
+        state = orchestrator.run(task_input.repo, task_input.task)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=stderr)
+        return EXIT_INTERRUPTED
+    stdout.write(config.redact(format_run(state)))
+    stdout.flush()
+    return EXIT_OK if state.phase == Phase.READY_FOR_VERIFICATION else EXIT_RUN_INCOMPLETE
 
 
 def _inspect(args: argparse.Namespace, *, environ: Optional[Mapping[str, str]], dotenv_path: Optional[Path],
@@ -252,8 +279,5 @@ def _report(config: Config, task_input: TaskInput) -> str:
         f"  Repository:      {task_input.repo} ({_git_status_label(task_input.repo)})",
         f"  Task source:     {task_input.source}",
         f"  Task:            {first_line} ({len(task_lines)} line(s), {len(task_input.task)} chars)",
-        "",
-        "Harness skeleton ready. The agent is not implemented yet (milestone M1):",
-        "no model was called and the repository was not modified.",
     ]
     return "\n".join(rows) + "\n"

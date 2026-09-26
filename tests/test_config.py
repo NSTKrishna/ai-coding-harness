@@ -68,6 +68,16 @@ class LoadConfigTest(unittest.TestCase):
         self.assertEqual(config.limits.max_repair_cycles, 1)
         self.assertEqual(config.limits.command_timeout_seconds, 30)
 
+    def test_model_and_tool_call_budgets(self):
+        config = load_config({"AI_API_KEY": FAKE_KEY, "HARNESS_MAX_MODEL_CALLS": "5",
+                              "HARNESS_MAX_TOOL_CALLS": "9"}, NO_DOTENV)
+        self.assertEqual((config.limits.max_model_calls, config.limits.max_tool_calls), (5, 9))
+        defaults = load_config({"AI_API_KEY": FAKE_KEY}, NO_DOTENV).limits
+        self.assertEqual((defaults.max_model_calls, defaults.max_tool_calls),
+                         (cfg.DEFAULT_MAX_MODEL_CALLS, cfg.DEFAULT_MAX_TOOL_CALLS))
+        with self.assertRaises(ConfigError):
+            load_config({"AI_API_KEY": FAKE_KEY, "HARNESS_MAX_TOOL_CALLS": "0"}, NO_DOTENV)
+
     def test_invalid_limits_name_the_variable(self):
         for value in ("abc", "0", "-3", "1.5"):
             with self.subTest(value=value):

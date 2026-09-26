@@ -1,241 +1,243 @@
 # Implementation Progress
 
-Last updated: 2026-09-26 (M3 complete and verified; M2 and M3 not committed)
+Last updated: 2026-09-26 (M4 complete and verified; not committed)
 
 ## Current milestone
 
-**M3 — Repository intelligence and bounded working context: DONE, verified.**
-M4 has not started and waits for explicit go-ahead.
+**M4 — Application/agent control layer: DONE, verified.**
+M5 has not started and waits for explicit go-ahead.
 
 ## Current repository state
 
-- Branch `main`. HEAD `34d0896` (M1). **There is no M2 commit.** M2 and M3 are both uncommitted
-  in the working tree (the project rules forbid automatic commits). Before M3 started, the M2
-  working tree was copied to `<scratchpad>/m2-baseline` (39 files) so that M3's changes could
-  be listed separately (below).
-- Built:
-  - **M1:** CLI (`harness run`), config, Makefile, packaging
-  - **M2:** model interface (`ModelClient`, `ScriptedModel`, `MeteredModelClient`), `ExecutionMetrics`,
-    `ToolRegistry` + 11 tools
-  - **M3:** `harness/repo/` (inventory, classification, facts, profile, command discovery, task
-    signals, candidate discovery/ranking, report), `harness/context/` (`WorkingSet`,
-    `ContextManager`), `harness inspect` CLI, `ContextLimits` configuration
-- **Not built:** live provider adapter, planner, executor/action protocol, orchestrator/state
-  machine, verification engine, evidence ledger, failure recovery, context compaction, run
-  report. `harness run` still only validates input and exits.
+- Branch `main`.
+  - `34d0896` — M1.
+  - `d2c6e1a` — M2 + M3 checkpoint, committed at the start of M4 at the user's request
+    (234 tests passing, credential scan clean).
+  - M4 is uncommitted in the working tree on top of `d2c6e1a`.
+- M4 changes (`git status` against `d2c6e1a`):
+  - new: `src/harness/orchestrator/{__init__,state,protocol,plan,observe,executor,interpreter,orchestrator,report}.py`,
+    `src/harness/model/factory.py`, `tests/orchestration_helpers.py`, `tests/test_{run_state,planner,
+    action_protocol,orchestrator,interpreter,model_factory}.py`
+  - modified: `src/harness/cli.py` (run → model factory → orchestrator), `src/harness/config.py`
+    (`max_model_calls`, `max_tool_calls`), `tests/test_cli.py`, `tests/test_config.py`, `arch.md`,
+    `README.md`, `.env.example`, `REQUIREMENTS.md`, `PROGRESS.md`
+  - **No M2 or M3 source file changed** (`git diff` over `tools/ repo/ context/ metrics.py
+    model/client.py model/types.py` is empty).
+- **Not built:** live provider adapter, verification engine, evidence ledger, failure
+  classification/repair/replan, compaction, run directory/report files.
 
-### M3 changes relative to the M2 snapshot
+### M1 tests intentionally changed
 
-- New: `src/harness/repo/{__init__,classify,inventory,reader,facts,commands,profile,signals,discovery,report}.py`,
-  `src/harness/context/{__init__,working_set,manager}.py`, `tests/repo_fixtures.py`, and 8 test
-  modules (`test_repo_inventory`, `test_repo_profile`, `test_task_signals`, `test_discovery`,
-  `test_working_set`, `test_context_manager`, `test_command_discovery`, `test_inspect_cli`).
-- Modified: `src/harness/cli.py` (`inspect` subcommand), `src/harness/config.py` (`ContextLimits`,
-  `load_context_limits`, key-free settings reader), `src/harness/tools/search.py`,
-  `src/harness/tools/git.py`, `tests/test_search.py`, `arch.md` (§3, §6–§8, §11, §17, §20–§22),
-  `README.md`, `.env.example`.
-- M2 changes made in M3, both backwards compatible, both tested:
-  - `search()` gained `allowed_paths` (Python API only; not a tool argument). In scoped mode
-    ripgrep still walks the directory and results are filtered, because ripgrep searches
-    explicitly named files even when they are binary or over `--max-filesize`. Passing them
-    explicitly broke engine parity (observed, then fixed).
-  - **M2 defect fixed:** the Python engine split lines with `str.splitlines()`, which also
-    breaks on form feeds and U+2028, so line numbers could differ from ripgrep. It now splits
-    on `\n` only (`test_line_numbers_split_on_newline_only`).
-  - `tools/git.py` gained `git_work_tree_prefix` and `git_list_files` (read-only `ls-files`;
-    raises instead of returning a truncated listing).
+Nine M1 CLI tests asserted that accepted input exits 0 with "Harness skeleton ready". In M4,
+`harness run` continues to model execution. With no adapter it now prints the same accepted-input
+report, then `error: No model provider is configured …` / `… not supported by this build …`, and
+exits 2. The tests now assert that stricter behavior (input accepted and reported, precise provider
+error, "No model was called and the repository was not modified"). Their input-handling coverage
+is unchanged.
 
-## Gap analysis (after M3)
-
-REQUIREMENTS.md holds the per-item evidence. Items not listed are MISSING.
+## Gap analysis (after M4)
 
 | Req | Item | Status |
 |---|---|---|
-| R1 | Accept task | PARTIAL |
-| R1 | Inspect repository; determine relevant files | PARTIAL (components verified; not used by `run`) |
-| R1 | Understand task; modify; verify | MISSING |
-| R2 | Analyzer exists; targeted discovery; no blind loading | IMPLEMENTED AND VERIFIED |
-| R2 | Deterministic search before model calls | PARTIAL (no orchestrator to order it yet) |
-| R3 | Lifecycle (all) | MISSING |
-| R4 | Working vs permanent context; snippets selected | IMPLEMENTED AND VERIFIED |
-| R4 | Repeated context avoided | PARTIAL (dedup of identical items only) |
+| R1 | Accept task; inspect repository; determine relevant files | IMPLEMENTED AND VERIFIED |
+| R1 | Understand task; modify implementation | PARTIAL (scripted model only) |
+| R1 | Verify modifications | MISSING |
+| R2 | All four items | IMPLEMENTED AND VERIFIED |
+| R3 | Lifecycle; plan; execute | IMPLEMENTED AND VERIFIED |
+| R3 | Finish/terminate | PARTIAL (clean termination; no verified finish) |
+| R3 | Verify; repair | MISSING |
+| R4 | Working vs permanent; snippets selected | IMPLEMENTED AND VERIFIED |
+| R4 | Repeated context avoided | PARTIAL |
 | R4 | Compaction | MISSING |
-| R5 | Read, search, patch, command, git diff | IMPLEMENTED AND VERIFIED |
-| R5 | Run tests | PARTIAL (commands discovered + runnable; not connected) |
-| R6 | Failure recovery (all) | MISSING |
-| R7 | Verification (all) | MISSING |
-| R8 | Model/tool calls tracked | IMPLEMENTED AND VERIFIED |
-| R8 | Context usage controlled; expensive ops avoided | PARTIAL |
+| R5 | All six items | IMPLEMENTED AND VERIFIED (driven end to end by the executor) |
+| R6 | Failed test detected; infinite loops prevented | PARTIAL (recorded / budget-bounded only) |
+| R6 | Classification; repair/replan; retry limit | MISSING |
+| R7 | All | MISSING |
+| R8 | Model calls, tool calls tracked; context usage controlled | IMPLEMENTED AND VERIFIED |
+| R8 | Expensive operations avoided | PARTIAL |
 | R8 | Targeted tests before full suite | MISSING |
-| R9 | Makefile setup/test/clean | IMPLEMENTED AND VERIFIED; `make run` PARTIAL |
-| R10 | Credentials (all) | IMPLEMENTED AND VERIFIED |
-| R11 | Provider abstraction | IMPLEMENTED AND VERIFIED; text-only, configurable PARTIAL |
-| R12 | Dependencies declared | IMPLEMENTED AND VERIFIED; others PARTIAL |
+| R9 | `make run` | PARTIAL (no live adapter); rest VERIFIED |
+| R10 | All | IMPLEMENTED AND VERIFIED |
+| R11 | Provider abstraction | VERIFIED; text-only / configurable PARTIAL |
+| R12 | Dependencies declared | VERIFIED; others PARTIAL |
 
 ## Missing P0 components
 
-1. ~~Scaffolding, Makefile, config~~ (M1)
-2. ~~Model interface, fake model, accounting~~ (M2)
-3. ~~Tool layer + registry~~ (M2)
-4. ~~Repository intelligence~~ (M3)
-5. Context: ~~working set, permanent/working/episodic stores~~ (M3); compaction and the
-   turn-history context for model calls are still missing (R4, R8)
-6. Orchestrator: `RunState`, state machine, budgets enforced, planner, executor/action protocol (R1, R3, R6)
-7. Verification engine + evidence ledger + failure classification (R6, R7)
-8. Run report / telemetry output (R8)
-9. E2E fixture runs with the scripted model (R1, R7, R12)
-10. Live provider adapter, once announced (R11)
+1. ~~Scaffolding, config, CLI~~ (M1) · ~~model interface, tools~~ (M2) · ~~repository intelligence,
+   working set, context manager~~ (M3) · ~~RunState, planner, executor, orchestrator~~ (M4)
+2. Verification engine: baseline tests, layered verification, regression check, diff review,
+   acceptance-criteria mapping (R7)
+3. Evidence ledger (R7)
+4. Failure classification, repair/replan loop, `max_repair_cycles`, no-progress detection (R6)
+5. Compaction of old observations; "unchanged since" re-read marker (R4)
+6. Run directory / report files (R8, arch §19)
+7. Live provider adapter, once announced (R11, R9 `make run`)
 
 ## Dependency ordering
 
 ```text
-repo intelligence + working set (done) ─┐
-model interface + tools (done) ─────────┼─▶ 6 orchestrator/planner/executor ─▶ 8 report ─▶ 9 E2E ─▶ 10 live adapter
-tools (done) ─▶ 7 verifier + ledger ────┘
+M4 control layer (done) ─▶ M5 verification + ledger ─▶ M6 repair/replan loop ─▶ M7 report, compaction,
+                                                                                 live adapter, hardening
 ```
 
 ## Next 3 implementation milestones
 
-### M4 — Orchestrator, planner and executor (R1, R3, R6 partial)
+### M5 — Verification engine and evidence ledger (R7, R1 verify)
 
-- `RunState`, state machine (INIT → UNDERSTAND → DISCOVER → PLAN → EXECUTE → VERIFY → REPAIR →
-  SUCCEEDED/FAILED/ABORTED) with `max_steps`/`max_repair_cycles` enforced
-- DISCOVER = `discover_for_task` + baseline test run with the top test command
-- Planner and executor over `ToolRegistry` + `MeteredModelClient`; text action protocol for
-  models without native tool calls; `ContextManager` feeds prompts
-- Done when: `ScriptedModel` drives fixture repos through every state, and loop/limit tests
-  prove termination.
+- READY_FOR_VERIFICATION → VERIFYING → VERIFIED | NEEDS_REPAIR (add the transitions)
+- Baseline test run before EXECUTE; targeted then broader tests from `plan.verification_candidates`
+  or discovered commands; regression check against baseline; `git_diff`/`git_diff_stat` review;
+  acceptance-criteria → evidence mapping; explicit INCONCLUSIVE when no command exists
+- Done when: scripted runs reach VERIFIED only with passing evidence after the last patch, and
+  NEEDS_REPAIR on a failing fix.
 
-### M5 — Verification, evidence, recovery (R6, R7, R8)
+### M6 — Failure recovery (R6, R3 repair)
 
-- Layered verification (targeted tests, then full suite; baseline regression check; diff
-  review via `git_diff`/`git_diff_stat`), evidence ledger, failure classes and signatures, replan
-- Done when: E2E covers clean fix, fail → repair → pass, and stop-at-limit.
+- Failure classes and signatures, repair and replan paths, `max_repair_cycles`, no-progress detection
+- Done when: fail → repair → pass and stop-at-limit E2E tests pass.
 
-### M6 — CLI integration, run report, compaction, submission hardening (R4, R8, R9, R12)
+### M7 — Run report, compaction, CLI, submission hardening (R4, R8, R9, R12)
 
-- `make run` performs a real run; run directory with `events.jsonl`, `state.json`, `report.md`
-- Deterministic compaction of old observations; `ToolLimits` wired to configuration; live adapter
-  once the provider is announced; clean-environment rehearsal
+- Run directory (`events.jsonl`, `state.json`, `report.md`), deterministic compaction, live
+  adapter once announced, clean-environment rehearsal.
 
 ## Completed
 
-- M1 (2026-09-26, `34d0896`): scaffolding, Makefile, config, CLI.
-- M2 (2026-09-26, uncommitted): model interface, tools, registry, metrics; Makefile `.pth` fix.
-- M3 (2026-09-26, uncommitted): repository intelligence, working set, context manager, `inspect`;
-  search scope extension and line-splitting fix.
+- M1 (`34d0896`), M2 + M3 (`d2c6e1a`), M4 (2026-09-26, uncommitted).
 
 ## Currently implementing
 
-Nothing. Awaiting go-ahead for M4.
+Nothing. Awaiting go-ahead for M5.
 
-## Verified — M3 evidence
+## Verified — M4 evidence
 
-All on macOS (Darwin 25.6.0), from the project root. Scripts: `<scratchpad>/verify_m3.sh`
-(build/test matrix). Fresh copies come from `git ls-files -co --exclude-standard`.
+macOS (Darwin 25.6.0), project root. Scripts: `<scratchpad>/verify_m4.sh` (build/test matrix)
+and `<scratchpad>/trace_m4.py` (ScriptedModel trace).
 
-| # | DoD item | Command / test | Result |
+| # | DoD item | Evidence | Result |
 |---|---|---|---|
-| 1 | M1/M2 tests pass | `make test`: config 14, cli 21, model 19, registry 14, file_tools 19, search 14 (9 M2 + 5 M3), patch 14, git_tools 9, commands 23, secrets 4 | OK |
-| 2 | Git ignore behavior at intelligence layer | `GitInventoryTest` (7): exact inventory `(.gitignore, src/app.py, untracked_note.py)` from a repo containing gitignored, `.venv`, `node_modules`, `dist`, `__pycache__` files; `test_gitignored_files_are_never_candidates` | OK |
-| 3 | Non-git fallback | `FilesystemInventoryTest`, `NonGitProfileTest`, `NonGitDiscoveryTest` | OK |
-| 4 | RepoProfile | `tests.test_repo_profile` (7): Python/TS/Go/non-git/config recognition/empty | OK |
-| 5 | Deterministic task signals | `tests.test_task_signals` (8), including the brief's example | OK |
-| 6 | Ranked with reasons | `FixtureRankingTest` (4), `RankingRulesTest` (7): explicit path first, identifier beats keyword, reasons on every candidate | OK |
-| 7 | Source/test influence | `PairingKeyTest`, `PairingBoostTest` (test file linked only by naming convention is boosted) | OK |
-| 8 | Discovery bounded | `test_discovery_reads_few_files` (303 files: ≤ 8 candidate reads, < 5% read in total), `test_common_keywords_are_ignored` | OK |
-| 9–10 | Evidence and WorkingSet bounded | `tests.test_working_set` (10): files, evidence count, chars for budgets 80–10 000, snippet lines, deterministic order | OK |
-| 11 | ContextManager | `tests.test_context_manager` (10) | OK |
-| 12–13 | No model, no key | `test_no_api_key_needed`, `test_profile_without_api_key`, inspect subprocess with `AI_API_KEY` removed | OK |
-| 14 | Test commands with evidence | `tests.test_command_discovery` (9): unittest, pytest (explicit vs referenced), repo venv, npm/yarn + placeholder, Go, Cargo, Makefile, no command for uncertain repositories | OK |
-| 15 | inspect CLI | `tests.test_inspect_cli` (7), plus manual runs below | OK |
-| 16 | No repository mutation | `test_repository_is_not_modified`, `test_repository_unchanged`; manual inspect runs: sha256 of every file incl. `.git` identical before/after (python 51 files, typescript 42, go 40, large 934) | OK |
-| 17 | Selective exploration | metrics below | OK |
-| 18 | Clean/offline setup | working tree `make clean && make setup && make test` 0/0/0 (234 OK); fresh Python 3.10.19 0/0 (234 OK); fresh offline `PIP_NO_INDEX=1` 3.12 0/0 (234 OK, 1 offline warning); fresh without ripgrep 0/0 (234, 2 skipped) | OK |
-| — | Credentials | credential-pattern grep over tracked + untracked files: no matches; only fixture `test-key-7f3a9c1e5b` | OK |
+| 1 | Previous tests pass | all 234 pre-M4 tests pass (9 M1 CLI assertions updated to M4 behavior, above) | OK |
+| 2–3 | Typed RunState, enforced phases | `tests.test_run_state` (9): happy path, invalid moves, VERIFIED/NEEDS_REPAIR unreachable, terminals final | OK |
+| 4, 10 | Discovery wired, shared ToolContext | `test_discovery_runs_before_first_model_call_and_shares_the_tool_context`: order `[discover, plan]`, discovery ctx `is` registry ctx, `ctx.metrics is state.metrics` | OK |
+| 5 | Planner uses bounded WorkingSet | `test_planner_uses_the_m3_working_set`; `test_planner_receives_bounded_working_set_not_the_repository` (3,000-char limit, unrelated file content absent) | OK |
+| 6 | Structured plan | `tests.test_planner` (6; 13 rejection cases) | OK |
+| 7 | Native + text → same ToolCall path | `tests.test_action_protocol` (7); `test_native_and_text_tool_calls_both_dispatch` | OK |
+| 8–9 | One action per step; results update state | `test_one_action_per_model_call`, `test_each_observation_feeds_the_next_request` | OK |
+| 11–12 | Budgets and timeout from config | `BudgetTest` (7), `test_command_timeout_comes_from_configuration` | OK |
+| 13 | Authoritative counts | `test_counts_come_from_shared_metrics`; `RunState.model_calls/tool_calls` read `ExecutionMetrics` | OK |
+| 14–15 | Patch invalidation, modified files | `test_read_then_patch_then_complete`, `test_stale_working_set_evidence_is_removed_after_patch` | OK |
+| 16 | Command failure semantics | `test_failing_tests_are_a_successful_tool_call_with_a_failed_command` | OK |
+| 17 | Missing commands not invented | `test_missing_commands_are_stated_not_invented`, `test_invented_verification_command_is_rejected` | OK |
+| 18 | Portable interpreter | `tests.test_interpreter` (8); `test_planner_sees_resolved_interpreter_not_bare_python` | OK |
+| 19 | complete → READY_FOR_VERIFICATION only | integration tests; transition table; CLI says "NOT been verified" | OK |
+| 20 | Malformed output ends cleanly | `MalformedOutputTest` (9) | OK |
+| 21–22 | Offline ScriptedModel E2E, no key | `OrchestratorCase` removes `AI_API_KEY`; trace below | OK |
+| 23 | No live provider invented | `test_no_adapter_is_shipped`; `make run` → precise provider error | OK |
+| 24 | Offline setup | matrix below | OK |
 
-**Test count: 234** (146 M1+M2, 88 M3). Suite time ≈ 12 s.
+**Build/test matrix** (`verify_m4.sh`): working tree `make clean && make setup && make test` → 0/0/0,
+`Ran 303 tests … OK`; fresh copy Python 3.10.19 → 0/0 (303 OK); fresh copy offline
+(`PIP_NO_INDEX=1`, Python 3.12) → 0/0 (303 OK, 1 offline warning); fresh copy without ripgrep → 0/0
+(303, 2 skipped).
 
-### Discovery metrics from `harness inspect` (API key unset)
+**Test count: 303** (234 before M4 + 69 new: run_state 9, planner 6, action_protocol 7,
+orchestrator 31, interpreter 8, model_factory 4, cli +3, config +1). Suite ≈ 16 s.
 
-| Fixture | Top candidates | Metrics |
-|---|---|---|
-| Python, "Fix PaymentService refresh_token behavior" | service.py 120, test_service.py 59, tokens.py 27 | 10 files; 2 content searches → 3 files; read 3 config + 5 candidate files (1,019 B); 6 candidates; 2,328 / 24,000 chars; keyword search not needed |
-| TypeScript, "token refresh fails when the access token has expired" | token.test.ts 69, token.ts 65, session.ts 16 | 7 files; 8 searches → 3 files; 1 + 3 files read (755 B); 3 candidates; 1,546 chars; keyword search run |
-| Go, "ParseConfig returns an error for empty files" | parser.go 76, parser_test.go 59, cmd/app/main.go 20 | 5 files; 1 search → 3 files; 0 + 4 files read (390 B); 3 candidates; 1,431 chars; keywords skipped (definition found) |
-| Large (303 files), "InvoiceParser.parse_total mishandles commas" | invoice_parser.py 133, test_invoice_parser.py 107 | 303 files; 3 searches → 2 files; 2 config + 1 candidate file read (328 B); 2 candidates; 1,007 chars |
+### ScriptedModel trace (`trace_m4.py`, 204-file repository, fake key present in the environment)
 
-Not verified: Linux, Python 3.11/3.13, the evaluator environment, real-world large repositories.
+```text
+order:        discover_for_task -> model:plan -> model:step1 -> model:step2 -> model:step3 -> model:step4
+transitions:  DISCOVER -> PLAN -> EXECUTE -> READY_FOR_VERIFICATION
+repository:   204 files, 6,606 bytes; planner message 1,501 chars; working set 1,063 chars;
+              discovery read 1 candidate file; filler content in planner input: False
+step 1: read_file   success=True outcome=ok          stale=True  paths=[src/math_utils.py]
+step 2: apply_patch success=True outcome=ok          stale=False paths=[src/math_utils.py]
+step 3: run_tests   success=True outcome=command_ok  exit=0
+executor request sizes: [5336, 5539, 5601, 6218]
+math_utils evidence in working context after patch: False
+final: READY_FOR_VERIFICATION; steps=4 model_calls=5 tool_calls=3 command_calls=1 modified=[src/math_utils.py]
+fake key present anywhere in state/requests: False
+budget max_steps=3:       BUDGET_EXHAUSTED steps 3/3; model_calls=4 tool_calls=3; 3 scripted responses unused
+budget max_model_calls=3: BUDGET_EXHAUSTED model_calls 3/3; steps=2 tool_calls=2
+budget max_tool_calls=2:  BUDGET_EXHAUSTED tool_calls 2/2; steps=3 model_calls=4
+```
+
+**Manual `make run`** (key set, no provider): prints the accepted input, then
+`error: No model provider is configured (AI_MODEL_PROVIDER is not set) …`, "No model was called and the
+repository was not modified", exit 2. With `AI_MODEL_PROVIDER=acme`: "Configured model provider is not
+supported by this build: 'acme' (supported: none yet)". Fake key in output: 0 occurrences.
+`harness inspect` still works with the key unset.
+
+**Credential scan** over tracked + untracked files: no matches.
 
 ## Known issues / limitations
 
-- Ranking is heuristic. In the TS fixture the test file scores slightly above the source
-  (69 vs 65) because it mentions more task keywords; both are top 2 as required.
-- Definition detection uses per-language regexes on matching lines; it can miss unusual
-  definitions and occasionally treat an assignment as a definition. Python `ast` outlines remain
-  planned (arch.md §6).
-- Keyword stemming is crude (`retried` → `retr`). It only feeds case-insensitive substring
-  search, where low weights limit the damage.
-- Profile facts come from root-level configuration only; nested projects (monorepos) are listed
-  as manifests but not interpreted.
-- Test commands use the repository's `.venv/bin/python`/`venv/bin/python` when present, else a
-  bare `python`, which may not exist (e.g. macOS has only `python3`). M4 must choose the
-  interpreter.
-- From M2: the command policy is a guardrail, not a sandbox; cosmetic `make` error echo.
+- The step budget counts executor iterations only; the planner call counts toward
+  `max_model_calls`, not `max_steps`.
+- A tool budget of N allows N dispatches. If the model then chooses another tool, the run ends
+  `BUDGET_EXHAUSTED` without dispatching it (one model call is spent on that choice by design,
+  so the model can still `complete` right after its last allowed tool).
+- The profile summary in the repository context still shows M3's unresolved `python …` spelling.
+  The planner accepts it as an alias of the resolved command.
+- `sys.executable` (the harness interpreter) is the fallback when the repository has no virtualenv.
+  It will not have the target repository's dependencies (e.g. pytest). M5 must treat
+  "interpreter lacks the test framework" as an environment problem, not a code failure.
+- Executor window sizes (`ExecutorSettings`) are internal constants, not user configuration.
+- From earlier milestones: the command policy is a guardrail, not a sandbox; `make` echoes
+  `Error 2` after the harness's own message.
 
-## Notes for M4
+## Notes for M5
 
-- **Entry point:** `discover_for_task(repo, task, limits=config.context)` returns
-  `DiscoveryResult(repo_profile, task_signals, candidates, working_set, metrics, warnings)`.
-  Use `working_set.render()` as the planner's repository context (bounded, deterministic).
-- **Shared context:** pass one `ToolContext` (`discover_for_task(..., ctx=ctx)`) so discovery and
-  tools share root and limits. `RepoReader` and `DiscoveryMetrics` are separate from
-  `ExecutionMetrics` by design.
-- **Context manager:** `ContextManager(task, profile.summary(), config.context)`, then
-  `load_working_set(ws)`, then add tool observations with `add_working_item` and priorities.
-  Call `remove_source(path)` after `apply_patch` changes a file. Facts go through `record_fact`.
-- **Test commands:** `profile.test_commands` is ordered, high confidence first, and each entry
-  has a reason. None may exist: M4 must handle "no test command" explicitly (never invent one).
-  The interpreter question above applies.
-- **`ToolLimits` is still not wired to `Config`** (M2 note stands).
-- **Inventory scope:** use it for any further searches by passing
-  `allowed_paths=[f.path for f in inventory.files]`, so gitignored files stay out.
-- **No M2 checkpoint commit exists.** Commit M2 and M3 (together or separately) before M4, so
-  M4's diff can be reviewed on its own.
+- **Entry state:** `RunState` in `READY_FOR_VERIFICATION`. Add transitions
+  `READY_FOR_VERIFICATION → VERIFYING → VERIFIED | NEEDS_REPAIR` in `state.TRANSITIONS`; the enum
+  members already exist, so nothing else needs renaming.
+- **What to verify with:** `state.plan.verification_candidates` (chosen, resolved), falling back to
+  `state.repo_profile.test_commands` passed through `orchestrator.interpreter.resolve_command`. Either
+  can be empty; M5 must produce an explicit "no verification command" outcome, never invent one.
+- **What changed:** `state.modified_files` (patched files) and `git_diff`/`git_diff_stat` (these include
+  untracked new files). A baseline test run should happen before EXECUTE to separate pre-existing failures.
+- **What was claimed:** `state.plan.acceptance_criteria` and `state.terminal_reason` (the model's
+  complete summary). Neither is evidence.
+- **Command outcomes:** `Observation.outcome` distinguishes `command_ok` / `command_failed` /
+  `command_timed_out` from `tool_error`. Keep `success` (tool) and `outcome` (command) separate.
+- **Counts and budgets:** reuse `state.metrics` and the run's `ToolContext`/registry. Verification tool
+  calls count toward `max_tool_calls`, so decide whether verification gets its own budget.
+- **Unused so far:** `max_repair_cycles` (config) and `ContextManager.record_fact` (episodic facts;
+  a natural home for baseline results).
+- **Live model:** add an entry to `model/factory.ADAPTERS` once the provider is announced; nothing
+  else depends on the provider.
 
 ## Important architectural decisions
 
-- (M3) Repository intelligence owns scope. The search primitive stays generic, and scoping goes
-  through `allowed_paths`.
-- (M3) Git inventory = `ls-files --cached` + `--others --exclude-standard`, minus noise
-  directories; filesystem fallback outside git. `stat` only.
-- (M3) Configuration facts are read with line-based/stdlib parsers (no `tomllib`), so results
-  are the same on Python 3.10 and 3.14.
-- (M3) Commands are proposed only with explicit configuration evidence and are never executed
-  during analysis.
-- (M3) Ranking is additive with documented weights (arch.md §7); every point carries a reason,
-  and ties break by path.
-- (M3) Progressive discovery: names → identifiers → keywords only if needed; common keywords
-  dropped; one-hop imports.
-- (M3) Working-set limits are enforced on the exact rendered text, and omissions are counted.
-- (M3) `inspect` never loads the API key (`load_context_limits`).
-- (M2) Pure-Python patch applier, no implicit shell, read-only git, single path boundary,
-  provider-neutral model types, counting semantics (arch.md §9, §11, §13, §19, §25).
-- (M1) Python ≥ 3.10, stdlib only at runtime, `unittest`, `PYTHONPATH=src` in make targets.
+- (M4) One `ToolContext` per run (root, limits, metrics) shared by discovery, tools and the metered
+  model; config `command_timeout_seconds` flows into its `ToolLimits`.
+- (M4) Explicit phase table, with VERIFIED/NEEDS_REPAIR unreachable until M5. Every failure ends in a
+  terminal phase with a structured `Failure`, and no exception escapes `Orchestrator.run`.
+- (M4) Strict JSON protocols (plan and actions), whole-response only, no repair or retry. Native and
+  text tool calls converge on `ToolCall` → `ToolRegistry.dispatch_call`.
+- (M4) Budgets checked before the operation that would exceed them; exhaustion never costs an
+  extra model call.
+- (M4) Executor requests are rebuilt from bounded windows each step (not an accumulating conversation).
+- (M4) Tool errors are observations; only a tool crash (`internal_error`) is terminal.
+- (M4) The planner may only choose discovered verification commands; Python interpreters are
+  resolved as repository venv → `sys.executable` → PATH.
+- (M4) `harness run` fails precisely when no adapter exists; `ADAPTERS` is empty by design.
+- (M3) Repository intelligence owns scope; bounded working set; `inspect` needs no key.
+- (M2) Pure-Python patching, no implicit shell, read-only git, single path boundary.
+- (M1) Python ≥ 3.10, stdlib only, `unittest`, `PYTHONPATH=src` in make targets.
 
 ## Commands
 
 ```sh
 export AI_API_KEY="..."
 make setup        # idempotent, works offline
-make run          # interactive; still validates and exits
-make test         # 234 tests, offline, no key needed
+make run          # interactive; stops with a precise error until a live adapter exists
+make test         # 303 tests, offline, no key needed
 make clean
-
-PYTHONPATH=src .venv/bin/python -m harness inspect --repo PATH [--task "TEXT"] [--top N] [--show-context]
+PYTHONPATH=src .venv/bin/python -m harness inspect --repo PATH [--task "TEXT"]
 ```
 
 ## Last successful test
 
-2026-09-26: `make clean && make setup && make test` gave 234 tests OK on Python 3.14.3; also 234 OK
-on 3.10.19, on 3.12.13 offline, and without ripgrep (2 skipped).
+2026-09-26: `make clean && make setup && make test` gave 303 tests OK (Python 3.14.3); also 303 OK on
+3.10.19, on 3.12 offline, and without ripgrep (2 skipped).

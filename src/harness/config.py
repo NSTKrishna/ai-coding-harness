@@ -26,6 +26,8 @@ DEFAULT_BASE_URL: Optional[str] = None
 DEFAULT_MAX_STEPS = 40
 DEFAULT_MAX_REPAIR_CYCLES = 3
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+DEFAULT_MAX_MODEL_CALLS = 60
+DEFAULT_MAX_TOOL_CALLS = 80
 
 API_KEY_VAR = "AI_API_KEY"
 PROVIDER_VAR = "AI_MODEL_PROVIDER"
@@ -34,6 +36,8 @@ BASE_URL_VAR = "AI_BASE_URL"
 MAX_STEPS_VAR = "HARNESS_MAX_STEPS"
 MAX_REPAIR_CYCLES_VAR = "HARNESS_MAX_REPAIR_CYCLES"
 COMMAND_TIMEOUT_VAR = "HARNESS_COMMAND_TIMEOUT_SECONDS"
+MAX_MODEL_CALLS_VAR = "HARNESS_MAX_MODEL_CALLS"
+MAX_TOOL_CALLS_VAR = "HARNESS_MAX_TOOL_CALLS"
 
 # Working-context limits for repository discovery (see ContextLimits).
 CONTEXT_LIMIT_VARS = {
@@ -60,9 +64,11 @@ class ModelSettings:
 
 @dataclass(frozen=True)
 class Limits:
-    max_steps: int
-    max_repair_cycles: int
-    command_timeout_seconds: int
+    max_steps: int = DEFAULT_MAX_STEPS                # executor iterations (one model decision each)
+    max_repair_cycles: int = DEFAULT_MAX_REPAIR_CYCLES
+    command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS
+    max_model_calls: int = DEFAULT_MAX_MODEL_CALLS    # planner + executor, failed attempts included
+    max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS      # registry dispatches, failed ones included
 
 
 @dataclass(frozen=True)
@@ -194,6 +200,8 @@ def load_config(
             command_timeout_seconds=_positive_int(
                 COMMAND_TIMEOUT_VAR, get(COMMAND_TIMEOUT_VAR), DEFAULT_COMMAND_TIMEOUT_SECONDS
             ),
+            max_model_calls=_positive_int(MAX_MODEL_CALLS_VAR, get(MAX_MODEL_CALLS_VAR), DEFAULT_MAX_MODEL_CALLS),
+            max_tool_calls=_positive_int(MAX_TOOL_CALLS_VAR, get(MAX_TOOL_CALLS_VAR), DEFAULT_MAX_TOOL_CALLS),
         ),
         env_file=env_file,
         context=_context_limits(get),

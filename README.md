@@ -3,9 +3,11 @@
 An autonomous software-engineering harness around a text-only foundation model.
 Architecture: [arch.md](arch.md). Status: [PROGRESS.md](PROGRESS.md).
 
-> Current state: milestone M3. `harness run` validates configuration and input,
-> then exits; the agent loop is not implemented yet. Model interface, tools
-> (arch.md §9, §11) and repository intelligence (§6–§8, `harness inspect`) exist.
+> Current state: milestone M4. The control layer exists (discovery → plan →
+> one-action-per-step execution → `READY_FOR_VERIFICATION`; arch.md §4–§5, §10, §12)
+> and is exercised end to end with a scripted model. No live model adapter exists
+> yet (the provider has not been announced), so `make run` accepts input and then
+> stops with a precise "provider not supported" message. Verification (M5) is not built.
 
 ## Requirements
 
@@ -23,7 +25,9 @@ make run
 ```
 
 `make run` prompts for the repository path and the task (end the task with an
-empty line). You can also pass them directly:
+empty line). It then needs a model adapter for `AI_MODEL_PROVIDER`; this build
+has none, so it exits with code 2 and says so. Nothing is modified. You can also
+pass the input directly:
 
 ```sh
 make run ARGS='--repo /path/to/repo --task "Fix the failing date parser test"'
@@ -62,6 +66,8 @@ Set in the environment, or in a `.env` file in the directory you run from
 | `HARNESS_MAX_STEPS` | no | 40 |
 | `HARNESS_MAX_REPAIR_CYCLES` | no | 3 |
 | `HARNESS_COMMAND_TIMEOUT_SECONDS` | no | 300 |
+| `HARNESS_MAX_MODEL_CALLS` | no | 60 |
+| `HARNESS_MAX_TOOL_CALLS` | no | 80 |
 | `HARNESS_MAX_ACTIVE_FILES` | no | 8 |
 | `HARNESS_MAX_CANDIDATES` | no | 25 |
 | `HARNESS_MAX_EVIDENCE_ITEMS` | no | 24 |
