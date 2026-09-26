@@ -10,6 +10,13 @@ is spent:
 
 Changed files are re-read through ``read_file`` and put into working context,
 replacing any stale evidence, so the model repairs the current content.
+
+Repeated-failure stop rule (M6): after a repair, if verification reports the same
+failure signature (class + failing command + failing test ids, or the output hash
+when no ids are printed) as the previous round, ``repeated_failures`` grows. The
+loop stops, without another model call, when the repair changed no file
+(``no_progress``) or when ``repeated_failures`` reaches
+``max_repeated_failure_cycles``. A different signature resets the count.
 """
 
 from __future__ import annotations
@@ -17,7 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from harness.verify.engine import VerificationReport
+from harness.context.facts import ChangeFact, DecisionFact, FailureFact, RepairAttemptFact, VerificationFact
+from harness.verify.engine import Verdict, VerificationReport
 from harness.verify.outcomes import REPAIRABLE
 
 MAX_FRESH_FILES = 3
@@ -83,18 +91,49 @@ class RecoveryController:
         self.context = context   # the run's ContextManager
 
     def record_verification(self, report: VerificationReport) -> None:
-        """Episodic fact for every verification round (no reasoning, only observed outcome)."""
+        """Typed episodic facts for every verification round (observed outcomes only)."""
         failing = report.primary_failure
-        fp = ""
-        if failing is not None and failing.post.classification.fingerprint is not None:
-            f = failing.post.classification.fingerprint
-            fp = ",".join(sorted(f.failing_tests)) or f.output_hash
-        self.context.record_fact(
-            "verification",
-            f"round {report.round} after repair cycle {self.state.repair_cycles}: {report.verdict.value}"
-            + (f" {report.failure_class.value}" if report.failure_class else "")
-            + (f" [{failing.command.id} fingerprint {fp}]" if failing else "")
-            + f"; changed: {', '.join(report.changed_by_run) or 'none'}")
+        fp = _failure_text(report)
+        self.context.record(VerificationFact(
+            report.round, self.state.repair_cycles, report.verdict.value,
+            report.failure_class.value if report.failure_class else None,
+            failing.command.id if failing else None, fp, tuple(report.changed_by_run)))
+        if self.state.repair_cycles and report.round > 1:
+            self.context.record(RepairAttemptFact(
+                self.state.repair_cycles, _previous_class(self.state), "", tuple(report.changed_by_run),
+                f"verification round {report.round}: {report.verdict.value}"
+                + (f" {report.failure_class.value}" if report.failure_class else "")))
+        if report.verdict == Verdict.NEEDS_REPAIR:
+            self.context.record(FailureFact(fp or report.summary[:120], report.failure_class.value,
+                                            failing.command.id if failing else None, report.round))
+        for record in self.state.changes.records if self.state.changes is not None else ():
+            if record.before_sha256 != record.current_sha256:
+                self.context.record(ChangeFact(record.path, tuple(record.touched_in), record.patches))
+
+    def check_progress(self, report: VerificationReport) -> Optional[dict]:
+        """After a repair: returns stop details if the same failure keeps recurring."""
+        reports = self.state.verification_reports
+        if report.verdict != Verdict.NEEDS_REPAIR or len(reports) < 2 or reports[-2].verdict != Verdict.NEEDS_REPAIR:
+            self.state.repeated_failures = 0
+            return None
+        previous = reports[-2]
+        signature = _signature(report)
+        if signature != _signature(previous):
+            self.state.repeated_failures = 0
+            return None
+        self.state.repeated_failures += 1
+        unchanged = dict(previous.change_state) == dict(report.change_state)
+        if unchanged:
+            self.state.no_progress = True
+        if not unchanged and self.state.repeated_failures < self.limits.max_repeated_failure_cycles:
+            return None
+        why = ("the last repair changed no file and the failure is identical" if unchanged else
+               f"the same failure followed {self.state.repeated_failures} consecutive repair(s)")
+        details = {"no_progress": unchanged, "repeated_failures": self.state.repeated_failures,
+                   "limit": self.limits.max_repeated_failure_cycles, "signature": signature,
+                   "repair_cycles": self.state.repair_cycles}
+        self.context.record(DecisionFact("stop repair loop", why))
+        return {"reason": f"repeated_failure_no_progress: {why}", "details": details}
 
     def prepare(self, report: VerificationReport) -> RepairContext:
         """Raises ``RepairLimit`` before spending anything if a repair may not start."""
@@ -123,12 +162,10 @@ class RecoveryController:
         previous = self.state.verification_reports[-2] if len(self.state.verification_reports) >= 2 else None
         repeated = bool(previous and previous.failure_class == report.failure_class
                         and _fingerprint(previous) == _fingerprint(report) and _fingerprint(report))
-        self.context.record_fact(
-            "repair_attempt",
-            f"cycle {cycle} started for {report.failure_class.value}"
-            + (f" ({failing.command.id} {failing.command.text})" if failing else "")
-            + f"; files so far: {', '.join(report.changed_by_run) or 'none'}")
-        facts = [f"[{f.kind}] {f.text}" for f in self.context.facts() if f.kind in ("verification", "repair_attempt")]
+        self.context.record(RepairAttemptFact(cycle, report.failure_class.value, _failure_text(report),
+                                              tuple(report.changed_by_run), "started"))
+        facts = [f"[{f.kind}] {f.text}" for f in self.context.facts()
+                 if f.kind in ("verification", "repair_attempt", "failure", "decision")]
         diff_text = ""
         if report.diff_evidence_id:
             diff_text = self.state.evidence.get(report.diff_evidence_id).excerpt[:MAX_DIFF_EXCERPT]
@@ -142,6 +179,29 @@ class RecoveryController:
             failed_criteria=failed_criteria, modified_files=tuple(report.changed_by_run), fresh_files=tuple(fresh),
             diff_excerpt=diff_text, prior_attempts=tuple(facts[-MAX_FACTS_SHOWN:]), repeated_failure=repeated,
         )
+
+
+def _failure_text(report: VerificationReport) -> str:
+    failing = report.primary_failure
+    if failing is None or failing.post.classification.fingerprint is None:
+        return ""
+    f = failing.post.classification.fingerprint
+    return ",".join(sorted(f.failing_tests)) or f"output {f.output_hash}"
+
+
+def _signature(report: VerificationReport) -> str:
+    """Failure class + failing command + failing test ids (or output hash); criteria when no command."""
+    failing = report.primary_failure
+    base = report.failure_class.value if report.failure_class else ""
+    if failing is not None:
+        return f"{base}|{failing.command.id}|{_failure_text(report)}"
+    return base + "|" + ",".join(sorted(c.criterion for c in report.criteria_results if c.status == "FAIL"))
+
+
+def _previous_class(state) -> str:
+    reports = state.verification_reports
+    prior = reports[-2] if len(reports) >= 2 else None
+    return prior.failure_class.value if prior is not None and prior.failure_class else ""
 
 
 def _fingerprint(report: VerificationReport) -> str:

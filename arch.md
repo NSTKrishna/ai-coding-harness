@@ -9,7 +9,7 @@
 > architecture is intentionally revised. Revisions are deliberate edits to this
 > file, recorded in PROGRESS.md.
 
-Status markers used below: **[M1]**…**[M5]** built in that milestone, **[planned]** designed but not built.
+Status markers used below: **[M1]**…**[M6]** built in that milestone, **[planned]** designed but not built.
 What is actually implemented and verified is tracked in PROGRESS.md and REQUIREMENTS.md, not here.
 
 ---
@@ -125,7 +125,7 @@ Software Engineering Task
 | Evidence ledger | `harness/verify/ledger.py` **[M5]** | Append-only record of what was observed; change ledger |
 | Failure recovery | `harness/verify/outcomes.py`, `recovery.py` **[M5]** | Classify failures; bounded repair context |
 | Metrics | `harness/metrics.py` **[M2]** | Model/tool/command counters and token usage |
-| Telemetry | `harness/telemetry.py` [planned] | Event log and run report built on the metrics |
+| Telemetry | `harness/telemetry.py` **[M6]** | Run artifacts: events, summary, report, attributed diff |
 
 Components communicate through plain dataclasses (`TaskSpec`, `RepoProfile`,
 `Plan`, `ToolResult`, `ModelResponse`, `Evidence`, `FailureReport`). Only the
@@ -188,6 +188,8 @@ RunState(
     verification_commands, baseline, verification_reports,    # M5, §14
     evidence: EvidenceLedger, changes: ChangeLedger,          # M5, §15
     repair_cycles: int, repair_context: RepairContext | None, # M5, §16
+    repeated_failures, no_progress, targeting, compaction,    # M6, §8 §14 §16
+    context_snapshot (debug view), event_sink (telemetry),    # M6, §8 §19
     failure, terminal_reason, transitions, metrics, started_at, elapsed_seconds,
 )
 ```
@@ -382,16 +384,37 @@ estimated as `chars / 4` unless the adapter reports real usage.
 (content hash). **[planned]** Re-reading an unchanged region yields a short
 "unchanged since turn N" marker instead of the content.
 
-**Compaction [planned].** When the working store exceeds its budget, M3 evicts.
-Compaction replaces eviction for old observations, deterministically first:
+**Episodic facts [M6]** (`context/facts.py`): typed, observed/operational only —
+`RepositoryFact`, `VerificationFact`, `RepairAttemptFact`, `FailureFact`, `ChangeFact`,
+`DecisionFact`, `HistoryFact`. Kinds `verification`, `repair_attempt`, `failure`, `change`
+and `decision` are **protected**: never evicted by the fact cap or by compaction.
+`history` facts (compacted old observations) are the first to go.
 
-- test output → failing test ids + first assertion/traceback lines + counts
-- command output → exit code + head/tail lines
-- file reads → path + line range + "available on request"
+**Compaction [M6]** (`context/compaction.py`, deterministic, never a model call). The
+executor request is rendered from bounded state; when it exceeds
+`ContextLimits.compaction_threshold_chars` (default 60 000), stages run in this order,
+re-rendering after each, until it fits:
 
-A model-written summary is used only when deterministic compaction is not enough,
-and it counts as a model call.
+1. stale file contents (a later patch changed the file) are removed;
+2. repeated identical observations are shown once;
+3. older command outputs keep a 400-char tail (the latest is untouched);
+4. observations older than the last 2 become one-line `HistoryFact`s;
+5. the action-history window shrinks from 20 to 5;
+6. discovery evidence snippets are dropped, lowest priority first;
+7. the oldest history facts are dropped.
 
+Never dropped: the task, the plan and acceptance criteria, the verification/repair section
+(baseline, current failure output, current diff, prior attempts), current file contents
+re-read for repair, and protected facts. Stages 4 and 6–7 change stored context and
+persist; the rendering switches of 1–3 and 5 stay on once compaction has started. Every
+compaction appends a `CompactionRecord` (chars before/after, stages, stale sources
+removed, duplicates removed, excerpts trimmed, observations compacted, evidence dropped,
+facts retained, whether the limit was reached) to `RunState.compaction.records` and
+emits a `context_compacted` event. If irreducible content alone exceeds the threshold, the
+record says `reached_limit: false` rather than dropping protected content.
+`RunState.context_snapshot` (a `ContextSnapshot`) is a debug/test view of the last
+request: task, criteria, plan steps, verification section, working items, facts, and how
+each observation was shown.
 ---
 
 # 9. Model abstraction
@@ -617,8 +640,13 @@ check budgets ─▶ build request ─▶ model.generate ─▶ parse_action ─
   budgets, and the tool list (also passed as `ModelRequest.tools` for native
   tool calling). Request size stops growing once the windows fill (tested).
   Window sizes are `ExecutorSettings`, not user configuration.
-- **[planned]** Detecting repeated identical actions (`NO_PROGRESS`), repair and
-  replanning (M5+).
+- **No-progress detection [M6].** If the same tool call returns the same result
+  `max_identical_actions` (4) times in a row, execution stops in `BLOCKED` with
+  `Failure(kind="no_progress", details={no_progress: true, tool, repeats})` — no further
+  model call.
+- **Compaction [M6].** The request is built by `ContextRenderer` (§8) and compacted
+  deterministically above the threshold.
+- **[planned]** Replanning.
 
 ---
 
@@ -661,10 +689,34 @@ check budgets ─▶ build request ─▶ model.generate ─▶ parse_action ─
 **[M5]** `verify/engine.py`, `verify/commands.py`, `verify/outcomes.py`. Deterministic: no
 model call decides whether anything passed.
 
-**Verification command set** (chosen once, after planning, before editing; `V1`, `V2` …):
-test commands the plan selected (purpose `task`); if none, the first discovered test
-command (purpose `suite`, a broad fallback); then one high-confidence build command, then
-high-confidence typecheck/lint (purpose `check`; `task` if the plan selected them).
+**Verification command set** (chosen once, after planning, before editing): targeted
+test commands `T1`… first (M6, below); then test commands the plan selected (purpose
+`task`); if none, the first discovered test command (purpose `suite`, a broad fallback);
+then one high-confidence build command, then high-confidence typecheck/lint (purpose
+`check`; `task` if the plan selected them). A suite narrowed by a targeted command is a
+regression check (purpose `suite`).
+
+**Targeted tests [M6]** (`verify/targeting.py`, `TargetedCommand(argv, derived_from,
+confidence, parent_command_id, reason)`), derived before the baseline from the top-ranked
+discovery test file (score ≥ 20) or the plan's `files_to_inspect`, and only for frameworks
+whose selector syntax is certain:
+
+| Framework of the discovered suite | Targeted command | Condition |
+|---|---|---|
+| `python -m unittest discover` (top level = repo root) | `python -m unittest pkg.test_mod.Class.test_method` (or the module) | every directory of the test file is a package |
+| `python -m pytest` / `pytest` | `python -m pytest path/test_x.py::test_fn` (or `::Class::test`, or the file) | — |
+| `go test ./...` | `go test ./pkg -run '^(TestA)$'` (or the package) | — |
+
+Method/function level needs a test name containing a task term (identifier, name part
+or keyword stem); otherwise the file/module/package is targeted (confidence `medium`).
+Any other framework, no linked test file, or an unsafe module layout → no target, with the
+reason recorded (`TargetingResult.unavailable_reason`) and reported; the suite is used.
+`HARNESS_TARGETED_TESTS=false` disables derivation.
+
+**Escalation [M6].** The baseline runs every command within the cap (so every post-change
+result has a baseline). In a verification round, targeted commands run first; a suite
+they narrow runs only if every such target passed, and only while `verify_full_suite` is
+on (default). Skips are recorded as `NOT_RUN` evidence with the reason and listed as risks.
 Commands come only from discovery (never invented), with resolved interpreters. At most
 `max_verification_commands` run per round; the rest are recorded `NOT_RUN`. Every run is a
 registry dispatch (`run_tests`/`run_command`) counted in `max_tool_calls`.
@@ -712,18 +764,20 @@ after-baseline and final snapshots without a patch (reported as a risk).
 
 1. **NEEDS_REPAIR** if any repairable finding exists (priority: DIFF_PROBLEM, REGRESSION,
    TASK_TEST_FAILURE, BUILD, TYPECHECK, LINT, COMMAND_TIMEOUT) or any criterion is FAIL.
-2. **VERIFIED** if there is positive evidence and nothing above:
-   *strong* — a command FIXED or IMPROVED, or passes with more tests than at baseline;
-   *weak* — a plan-selected (`task`) test command passes before and after while the run
-   changed files (accepted; reported as the risk "may not exercise the change").
-   Pre-existing failures, commands not run and environment problems of other commands are
-   listed as risks, never hidden.
+2. **VERIFIED** only with **strong** evidence and nothing above **[M6 policy]**:
+   a command went fail→pass (`FIXED`), or fail→fewer failures with none new (`IMPROVED`);
+   or, for a purely structural task, every acceptance criterion is PASS by the
+   deterministic file-existence check. **Weak** evidence — a command that passed before
+   and after, including with more tests than at baseline (a new test's failure before
+   the change is not observed) — shows only "no detected regression" and never verifies
+   a task (→ UNVERIFIED, with the weak results listed). Pre-existing failures, commands
+   not run and environment problems of other commands are listed as risks, never hidden.
 3. **BLOCKED** if verification commands exist but none could run because of the
    environment (e.g. the interpreter lacks the test framework): verification is impossible
    here, and a code patch would not fix that. No repair is attempted.
 4. **UNVERIFIED** otherwise: no command exists (`NO_VERIFICATION_EVIDENCE`), or commands ran
-   but gave no positive evidence (only pre-existing failures, only unselected pass→pass,
-   timeouts on both sides, some environment errors).
+   but gave no strong evidence (only weak pass→pass, only pre-existing failures, timeouts
+   on both sides, some environment errors).
 
 A run whose tool budget runs out before verification completes ends `BUDGET_EXHAUSTED`,
 never VERIFIED. There is no model-based criteria assessor.
@@ -779,12 +833,23 @@ verification/repair facts, and a warning if the last repair left an identical fa
 fingerprint. The same Executor and ToolRegistry run the repair (phase `REPAIRING`); the
 context is the only difference. `complete` → `READY_FOR_VERIFICATION` → verified again.
 
-**Repair memory.** Episodic facts in the ContextManager: `verification` (round, cycle,
-verdict, class, failing command fingerprint, changed files) and `repair_attempt` (cycle,
-failure, files). No reasoning is stored.
+**Repair memory.** Typed, protected facts (§8): `VerificationFact` per round,
+`FailureFact` per unresolved failure, `RepairAttemptFact` when a repair starts and again
+with the verdict that followed it, `ChangeFact` per changed file, `DecisionFact` for
+stops. They survive compaction. No reasoning is stored.
 
-**[planned]** Replanning, rollback of a failed attempt, and a stop rule for repeated
-identical failures (currently only a warning to the model).
+**Repeated-failure stop rule [M6].** After each repair, the verification's failure
+signature (failure class + failing command id + failing test ids, or the output hash
+when no ids are printed; failing criteria when no command failed) is compared with the
+previous round's. The same signature increments `repeated_failures`; a different one
+resets it to 0. The loop stops — before any further model call — when the repair changed
+no file (`no_progress`, file hashes identical to the previous round) or when
+`repeated_failures` reaches `max_repeated_failure_cycles` (default 2). The run ends
+`UNVERIFIED` with `Failure(kind="repeated_failure_no_progress", details={no_progress,
+repeated_failures, limit, signature, repair_cycles})` and a `DecisionFact`. Assertion
+messages that differ while the same tests fail do not count as progress.
+
+**[planned]** Replanning and rollback of a failed attempt.
 
 ---
 
@@ -795,6 +860,9 @@ identical failures (currently only a warning to the model).
 | Executor steps (one model decision each) | `max_steps` **[M1]**, enforced **[M4]** | 40 |
 | Repair cycles (0 = verify, never repair) | `max_repair_cycles` **[M1]**, enforced **[M5]** | 3 |
 | Verification commands per round | `max_verification_commands` **[M5]** (runs still count in `max_tool_calls`) | 3 |
+| Same failure after consecutive repairs before stopping | `max_repeated_failure_cycles` **[M6]** | 2 |
+| Identical tool call + result in a row before stopping | `ExecutorSettings.max_identical_actions` **[M6]** | 4 |
+| Executor request size before compaction (chars) | `compaction_threshold_chars` **[M6]** | 60 000 |
 | Command timeout (seconds) | `command_timeout_seconds` **[M1]**, enforced by the command tools **[M2]**, wired from config into the run's `ToolLimits` **[M4]** | 300 |
 | Model calls (planner + executor, failures included) | `max_model_calls` **[M4]** | 60 |
 | Tool calls (every dispatch) | `max_tool_calls` **[M4]** | 80 |
@@ -832,29 +900,35 @@ restores all snapshots instead.
 
 # 19. Telemetry
 
-**[M2] Counters** — `ExecutionMetrics` in `harness/metrics.py`, shared by the model
-wrapper and the tool registry through `ToolContext.metrics`:
+**Counters [M2]** — `ExecutionMetrics` (`harness/metrics.py`): `model_calls`,
+`model_failures`, input/output tokens as reported by the model client,
+`model_calls_without_usage`, `tool_calls`, `tool_failures`, `tool_calls_by_name`,
+`command_calls`. Never reset during a run.
 
-| Counter | Incremented |
+**Run artifacts [M6]** (`harness/telemetry.py`). Written only when the orchestrator is
+given a `RunRecorder` (the CLI does this when `HARNESS_TELEMETRY` is on, the default;
+unit tests do not). Directory: `<runs root>/<run_id>/`.
+
+*Runs root* (one rule): `HARNESS_RUNS_DIR` if set; else `<harness checkout>/.harness/runs`
+when running from a source checkout (the `make run` flow); else
+`$XDG_CACHE_HOME/coding-harness/runs`. If that location is the target repository or
+inside it, the cache location is used instead, so artifacts never enter the target's
+diff. `.harness/` is git-ignored in this repository.
+
+| File | Content |
 |---|---|
-| `model_calls`, `model_failures` | once per `MeteredModelClient.generate()` attempt; failures included |
-| `input_tokens`, `output_tokens` | from reported usage; `model_calls_without_usage` counts calls that reported none |
-| `tool_calls`, `tool_failures`, `tool_calls_by_name` | once per `ToolRegistry.dispatch()`, including unknown tools, invalid arguments and blocked commands |
-| `command_calls` | once per caller-supplied command actually launched by `run_command`/`run_tests`; blocked commands and internal git/ripgrep processes are not counted here |
+| `events.jsonl` | One JSON object per line: `ts`, `seq`, `run_id`, `phase`, `event`, bounded metadata (strings ≤ 300 chars, ≤ 20 items). Events: `run_started`, `phase_changed`, `discovery_completed`, `model_call_started/completed/failed` (purpose, sizes, duration, reported tokens — never prompts or outputs), `tool_call_started/completed` (tool, argument summary, success, error code, exit code, timeout, duration), `baseline_completed`, `verification_completed`, `repair_started`, `context_compacted`, `run_finished`. At most 5 000 events. |
+| `summary.json` | Machine-readable (`schema: harness-run-summary/1`): run id, task, final status, terminal reason, failure, repository, modified files, model/tool/command/verification-command counts, tokens, steps, repair cycles, repeated failures, no_progress, targeting, verification commands, baseline summary, every verification round with per-command comparisons and evidence ids, acceptance criteria, evidence summary (items with ids and refs), context metrics (compactions, discovery metrics, working-set size), unresolved risks, completion claims (labelled not evidence), elapsed time. |
+| `final_report.md` | Human report (§20): verdict and meaning, task, files changed, pre-existing changes, targeted verification (or why unavailable), baseline → post-change table per round with evidence ids, criteria, repairs, "why this is not verified" / "what blocks verification", risks, resource usage (model/tool/verification-command calls, tokens as reported, steps, repair cycles, elapsed, discovery and compaction metrics). Success wording only for VERIFIED. |
+| `final.diff` | Git only, when the run changed files: `git diff` limited to the run's changed paths, with a header naming pre-existing changes that are *not* included and flagging changed files that were already dirty before the run. |
 
-**[planned]** Also: model calls by purpose and latency, command durations, test
-runs (targeted vs full), repair cycles, replans, state transitions, wall-clock time.
-
-**[planned] Outputs**, written to the run directory (`.harness-runs/<run_id>/`
-under the current working directory by default, configurable, never inside the
-target repo):
-
-- `events.jsonl` — one structured event per transition, model call and tool call
-- `state.json` — latest `RunState`
-- `report.md` — human summary: outcome, evidence ids, diff stat, counters
-
-All text written or printed passes through a redaction filter that replaces
-the API key value with `***` (the registry already does this for tool results).
+Model and tool events come from thin proxies (`RecordingModel`, `RecordingRegistry`)
+around the metered model and the registry; counting stays in `ExecutionMetrics`. Phase
+changes and compaction reach the recorder through `RunState.emit`. Everything written
+passes through the run's redactor; the API key is never part of any structure. Artifact
+generation (including the final diff) happens after the run and is outside its budgets.
+Artifacts are written in a `finally`, so failed runs leave them too; a write failure
+never changes the run's outcome.
 
 ---
 
@@ -866,7 +940,14 @@ Entry points: `python -m harness` and the `harness` console script (installed by
 ```text
 harness run [--repo PATH] [--task TEXT | --task-file FILE]
 harness inspect --repo PATH [--task TEXT | --task-file FILE] [--top N] [--show-context]
+harness runs [--limit N]
+harness report RUN_ID [--json]
 ```
+
+- **[M6]** `runs` lists saved runs (id, final status, start time, task) newest first;
+  `report` prints a run's `final_report.md` (or `summary.json` with `--json`). Both read
+  only the artifact root: no API key, no model, no repository access. Run ids must match
+  `[A-Za-z0-9_-]{1,64}`. `run` prints `Run artifacts: <dir>` when telemetry is on.
 
 - **[M3]** `inspect` prints the `RepoProfile`; with a task, also the task
   signals, the top N candidates with reasons (`*` = selected for the working
@@ -924,6 +1005,12 @@ already set in the environment.
 | `HARNESS_MAX_MODEL_CALLS` | `limits.max_model_calls` **[M4]** | no | 60 |
 | `HARNESS_MAX_TOOL_CALLS` | `limits.max_tool_calls` **[M4]** | no | 80 |
 | `HARNESS_MAX_VERIFICATION_COMMANDS` | `limits.max_verification_commands` **[M5]** | no | 3 |
+| `HARNESS_MAX_REPEATED_FAILURE_CYCLES` | `limits.max_repeated_failure_cycles` **[M6]** | no | 2 |
+| `HARNESS_TARGETED_TESTS` | `limits.targeted_tests` **[M6]** | no | true |
+| `HARNESS_VERIFY_FULL_SUITE` | `limits.verify_full_suite` **[M6]** | no | true |
+| `HARNESS_CONTEXT_COMPACTION_THRESHOLD` | `context.compaction_threshold_chars` **[M6]** | no | 60 000 |
+| `HARNESS_TELEMETRY` | `telemetry_enabled` **[M6]** | no | true |
+| `HARNESS_RUNS_DIR` | `runs_dir` **[M6]** | no | see §19 |
 | `HARNESS_MAX_ACTIVE_FILES` | `context.max_active_files` **[M3]** | no | 8 |
 | `HARNESS_MAX_CANDIDATES` | `context.max_candidates` **[M3]** | no | 25 |
 | `HARNESS_MAX_EVIDENCE_ITEMS` | `context.max_evidence_items` **[M3]** | no | 24 |
@@ -960,7 +1047,7 @@ from child-process environments (§25).
 │   ├── cli.py                [M1]
 │   ├── config.py             [M1]
 │   ├── metrics.py            [M2] ExecutionMetrics
-│   ├── telemetry.py          [planned]
+│   ├── telemetry.py          [M6] RunRecorder, recording proxies, summary, runs root
 │   ├── model/                [M2] types.py, client.py (ModelClient, MeteredModelClient), fake.py
 │   │                         [M4] factory.py (create_model_client; ADAPTERS empty)
 │   │   └── adapters/         [planned] one module per provider, once announced
@@ -968,10 +1055,10 @@ from child-process environments (§25).
 │   │                              patch.py, commands.py, git.py
 │   ├── repo/                 [M3] classify.py, inventory.py, reader.py, facts.py, commands.py,
 │   │                              profile.py, signals.py, discovery.py, report.py
-│   ├── context/              [M3] working_set.py, manager.py   (compaction.py planned)
+│   ├── context/              [M3] working_set.py, manager.py  [M6] facts.py, compaction.py
 │   ├── orchestrator/         [M4] state.py, protocol.py, plan.py, observe.py, executor.py,
 │   │                              interpreter.py, orchestrator.py, report.py
-│   └── verify/               [M5] commands.py, outcomes.py, ledger.py, engine.py, recovery.py
+│   └── verify/               [M5] commands.py, outcomes.py, ledger.py, engine.py, recovery.py  [M6] targeting.py
 └── tests/
     ├── test_config.py        [M1]
     ├── test_cli.py           [M1]
@@ -985,6 +1072,8 @@ from child-process environments (§25).
     ├── test_run_state.py  test_planner.py  test_action_protocol.py  test_orchestrator.py   [M4]
     ├── test_interpreter.py  test_model_factory.py   [M4]
     ├── test_verification_outcomes.py  test_verification.py   [M5]
+    ├── test_m6_targeting.py  test_m6_policy.py  test_m6_compaction.py   [M6]
+    ├── test_m6_telemetry.py  test_m6_integration.py (incl. 1 000-file scale fixture)   [M6]
     ├── fixtures/             [planned] templates for small target repositories
     └── e2e/                  [planned] full-loop tests with the fake model
 ```
@@ -1083,6 +1172,8 @@ make run
   (`python -c`, `make`, test code, script files). The harness does not isolate
   network or file system at the OS level; test code in the target repo runs with
   the user's permissions. Documented, not hidden.
+- **Artifacts [M6].** Run artifacts never contain the API key (redacted, never stored),
+  prompts or unbounded output, and are never written inside the target repository (§19).
 - **Prompt injection.** Repository contents, issue text and command output are data.
   They are placed in clearly delimited blocks, and the action protocol only accepts
   the defined tools; content cannot widen the tool set or the confinement.

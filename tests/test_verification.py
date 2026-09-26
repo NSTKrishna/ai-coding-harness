@@ -1,6 +1,7 @@
 """M5 end-to-end: baseline -> execute -> verify -> (repair -> verify) with ScriptedModel, offline, no key."""
 
 import os
+from dataclasses import replace
 import shutil
 import tempfile
 import unittest
@@ -36,6 +37,8 @@ class VerificationCase(unittest.TestCase):
         os.environ.pop("AI_API_KEY", None)
 
     def run_task(self, files, *script, limits=None, task=TASK, name="repo", untracked=None):
+        # M5 scenarios pin the M5 command set (no targeted command); M6 targeting has its own tests.
+        limits = replace(limits or Limits(), targeted_tests=False)
         self.root = git_repo(self.base / name, files, untracked)
         self.model = ScriptedModel(list(script))
         self.state = Orchestrator(self.model, limits=limits).run(self.root, task)
@@ -123,7 +126,8 @@ class RepairTest(VerificationCase):
         self.assertIn("-    return x + 2\n+    return x + 3", repair_request)   # the diff shows the change
         self.assertIn("[stale: src/math_utils.py changed after this step; read it again]", repair_request)
         self.assertIn("[verification] round 1 after repair cycle 0: NEEDS_REPAIR TASK_TEST_FAILURE", repair_request)
-        self.assertIn("[repair_attempt] cycle 1 started for TASK_TEST_FAILURE", repair_request)
+        self.assertIn("[repair_attempt] cycle 1: repairing TASK_TEST_FAILURE", repair_request)
+        self.assertIn("[failure] unresolved TASK_TEST_FAILURE in round 1", repair_request)
         self.assertLess(len(repair_request), 40_000)
 
     def test_suite_fallback_repairs_only_when_a_criterion_is_linked(self):
@@ -138,7 +142,9 @@ class RepairTest(VerificationCase):
 
 
 class RegressionTest(VerificationCase):
-    def test_regression_is_repaired_then_verified(self):
+    def test_regression_is_repaired_but_weak_evidence_is_unverified(self):
+        # M6 policy: after the repair the tests pass before and after (weak evidence). That shows
+        # "no detected regression", not that the task was resolved, so the run is UNVERIFIED.
         task = "Add a docstring to double without changing its behaviour."
         state = self.run_task(PASSING_REPO, plan_response(**SELECTED, acceptance_criteria=["double has a docstring"]),
                               tool("apply_patch", patch=BREAK_DOUBLE_PATCH), complete(),
@@ -147,9 +153,10 @@ class RegressionTest(VerificationCase):
         self.assertEqual(first.command_results[0].comparison, Comparison.REGRESSED)
         self.assertEqual((first.verdict, first.failure_class), (Verdict.NEEDS_REPAIR, FailureClass.REGRESSION))
         self.assertEqual(second.command_results[0].comparison, Comparison.UNCHANGED_PASS)
-        self.assertEqual(state.phase, Phase.VERIFIED)
         self.assertEqual(second.command_results[0].positive, "weak")
-        self.assertTrue(any("may not exercise the change" in r for r in second.risks))
+        self.assertEqual((state.phase, second.verdict), (Phase.UNVERIFIED, Verdict.UNVERIFIED))
+        self.assertIn("only weak evidence", second.summary)
+        self.assertTrue(any("does not show that the task was resolved" in r for r in second.risks))
         self.assertEqual(second.criteria_results[0].status, "UNKNOWN")
 
 
@@ -192,7 +199,7 @@ class EnvironmentAndEvidenceTest(VerificationCase):
         root = git_repo(self.base / "dirty", files, {"notes.txt": "user's own notes\n"})
         (root / "README.md").write_text("edited by the user\n")
         self.model = ScriptedModel([plan_response(), tool("apply_patch", patch=FIX_PATCH), complete()])
-        state = self.state = Orchestrator(self.model).run(root, TASK)
+        state = self.state = Orchestrator(self.model, limits=Limits(targeted_tests=False)).run(root, TASK)
         self.assertEqual(state.phase, Phase.VERIFIED)
         report = state.verification_reports[0]
         self.assertEqual(report.changed_by_run, ("src/math_utils.py",))
@@ -206,7 +213,7 @@ class EnvironmentAndEvidenceTest(VerificationCase):
         root = self.base / "plain"
         write_files(root, BUGGY_REPO)
         self.model = ScriptedModel([plan_response(), tool("apply_patch", patch=FIX_PATCH), complete()])
-        state = self.state = Orchestrator(self.model).run(root, TASK)
+        state = self.state = Orchestrator(self.model, limits=Limits(targeted_tests=False)).run(root, TASK)
         self.assertEqual(state.phase, Phase.VERIFIED)
         self.assertEqual({i.result for i in self.items(EvidenceKind.SNAPSHOT)}, {"UNAVAILABLE"})
         self.assertEqual(state.metrics.tool_calls_by_name.get("git_status", 0), 0)

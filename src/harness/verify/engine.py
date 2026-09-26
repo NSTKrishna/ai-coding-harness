@@ -9,15 +9,20 @@ Verdict policy (documented in arch.md §14):
 1. NEEDS_REPAIR if any repairable failure was found (regression, task test still
    failing, new build/lint/typecheck failure, new timeout, a criterion known to
    FAIL, or no change made although the plan has edit steps).
-2. VERIFIED if none of the above and there is positive evidence:
-   - strong: a command went fail -> pass, fail -> fewer failures (no new ones), or
-     passes with more tests than at baseline;
-   - weak (accepted, reported as a risk): a test command the plan selected passes
-     before and after, and this run changed files.
+2. VERIFIED if none of the above and there is STRONG evidence that the task was
+   resolved: a command went fail -> pass, or fail -> fewer failures with no new ones;
+   or every acceptance criterion is PASS by a deterministic structural check.
+   WEAK evidence (a command passed before and after, including with more tests)
+   only shows "no detected regression" and never verifies a task on its own (M6).
 3. BLOCKED if verification commands exist but none could run for environment
    reasons (verification is impossible here).
-4. UNVERIFIED otherwise (no command, only unrelated/pre-existing results, only
-   commands that passed both times without being selected, …).
+4. UNVERIFIED otherwise (no command, only weak evidence, only unrelated or
+   pre-existing results, …).
+
+Escalation (M6): targeted commands run first; a broad suite that a targeted command
+narrows runs only after the target passed (and only if ``verify_full_suite``). The
+baseline always runs every command within the cap, so post-change results have a
+baseline to compare with.
 """
 
 from __future__ import annotations
@@ -146,6 +151,7 @@ class VerificationReport:
     changed_outside_patches: tuple[str, ...]
     diff_evidence_id: Optional[str]
     risks: tuple[str, ...]
+    change_state: tuple[tuple[str, Optional[str]], ...] = ()   # (path, current sha256) of patched files
 
     @property
     def primary_failure(self) -> Optional[CommandVerification]:
@@ -188,19 +194,33 @@ class VerificationEngine:
                                            excerpt, "CLEAN" if not entries else "DIRTY")
         return RepoSnapshot(label, True, entries, stats, diff_text[:MAX_DIFF_EXCERPT], item.id)
 
-    def _run_commands(self, phase: str) -> tuple[tuple[CommandRun, ...], tuple[str, ...]]:
+    def _run_commands(self, phase: str, escalate: bool = False) -> tuple[tuple[CommandRun, ...], tuple[tuple[str, str], ...]]:
+        """Run the command set in order. With ``escalate``, a suite narrowed by a targeted
+        command runs only if that target passed (and ``verify_full_suite`` is on)."""
         runs, not_run = [], []
-        for command in self.state.verification_commands:
+        status: dict[str, CommandStatus] = {}
+        commands = self.state.verification_commands
+        for command in commands:
+            reason = None
             if not command.within_cap:
-                self.ledger.record_not_run(phase, command.id, command.kind, command.text,
-                                           f"over max_verification_commands ({self.limits.max_verification_commands})")
-                not_run.append(command.id)
+                reason = f"over max_verification_commands ({self.limits.max_verification_commands})"
+            elif escalate and command.level == "suite":
+                targets = [c for c in commands if c.parent_id == command.id and c.id in status]
+                failed = [t.id for t in targets if status[t.id] != CommandStatus.PASS]
+                if failed:
+                    reason = f"skipped: targeted {', '.join(failed)} did not pass, so the broad suite is not needed this round"
+                elif targets and not self.limits.verify_full_suite:
+                    reason = "skipped: targeted evidence is sufficient (verify_full_suite is off)"
+            if reason is not None:
+                self.ledger.record_not_run(phase, command.id, command.kind, command.text, reason)
+                not_run.append((command.id, reason))
                 continue
             tool = "run_tests" if command.kind == "test" else "run_command"
             result = self._dispatch(tool, {"command": list(command.argv)})
             classification = classify(command.kind, command.argv, result)
             item = self.ledger.record_command(phase, command.id, command.kind, command.text, classification)
             runs.append(CommandRun(command, phase, classification, item.id))
+            status[command.id] = classification.status
         return tuple(runs), tuple(not_run)
 
     # baseline -------------------------------------------------------------------
@@ -211,18 +231,18 @@ class VerificationEngine:
             return BaselineResult(False, (), (), initial, initial, item.id)
         runs, not_run = self._run_commands("baseline")
         after = self.snapshot("after-baseline", with_diff=False) if initial.available else initial
-        return BaselineResult(True, runs, not_run, initial, after)
+        return BaselineResult(True, runs, tuple(cid for cid, _ in not_run), initial, after)
 
     # verification ---------------------------------------------------------------
     def verify(self, round_no: int) -> VerificationReport:
         phase = f"post-{round_no}"
         baseline: BaselineResult = self.state.baseline
-        runs, not_run = self._run_commands(phase)
+        runs, not_run = self._run_commands(phase, escalate=True)
         final = self.snapshot(phase, with_diff=True)
 
         results = [self._assess_command(baseline.run_for(r.command.id) if baseline else None, r)
                    for r in runs]
-        risks = [f"{cid} not run: over max_verification_commands" for cid in not_run]
+        risks = [f"{cid} not run: {reason}" for cid, reason in not_run]
 
         changed = self.changes.net_changed()
         change_items = []
@@ -260,11 +280,13 @@ class VerificationEngine:
                                                                  Comparison.NO_BASELINE):
                 risks.append(f"{r.command.id} {r.command.text}: {r.note}")
             if r.positive == "weak":
-                risks.append(f"{r.command.id} passed before and after the change; it may not exercise the change")
+                risks.append(f"{r.command.id} passed before and after the change: no regression detected, "
+                             "but it does not show that the task was resolved")
 
-        verdict, failure_class, summary = self._decide(results, findings, changed)
+        verdict, failure_class, summary = self._decide(results, findings, changed, criteria)
+        change_state = tuple((r.path, r.current_sha256) for r in self.changes.records)
         return VerificationReport(round_no, verdict, failure_class, summary, tuple(results), tuple(criteria),
-                                  tuple(changed), preexisting, outside, diff_id, tuple(risks))
+                                  tuple(changed), preexisting, outside, diff_id, tuple(risks), change_state)
 
     def _assess_command(self, base: Optional[CommandRun], post: CommandRun) -> CommandVerification:
         cmd = post.command
@@ -282,7 +304,9 @@ class VerificationEngine:
         elif comparison == Comparison.UNCHANGED_PASS:
             before, after = base.classification.fingerprint.tests_run, post.classification.fingerprint.tests_run
             if before is not None and after is not None and after > before:
-                positive, note = "strong", f"passes with more tests than at baseline ({before} -> {after})"
+                positive = "weak"
+                note = (f"passes with more tests than at baseline ({before} -> {after}); the new tests' "
+                        "failure before the change was not observed")
             elif cmd.purpose == "task" and self.changes.net_changed():
                 positive, note = "weak", "passes before and after the change"
             else:
@@ -324,9 +348,9 @@ class VerificationEngine:
             if r.baseline is not None and r.baseline.classification.fingerprint is not None:
                 for test_id in r.baseline.classification.fingerprint.failing_tests - post_failing:
                     if r.post.classification.status in (CommandStatus.PASS, CommandStatus.TEST_FAILURE):
-                        fixed[test_id] = (r.baseline.evidence_id, r.post.evidence_id)
+                        fixed[test_id] = fixed.get(test_id, ()) + (r.baseline.evidence_id, r.post.evidence_id)
             for test_id in post_failing:
-                failing[test_id] = (r.post.evidence_id,)
+                failing[test_id] = failing.get(test_id, ()) + (r.post.evidence_id,)
         results_out = []
         for criterion in plan.acceptance_criteria:
             terms = self._criterion_terms(criterion)
@@ -374,7 +398,7 @@ class VerificationEngine:
         return tuple(sorted(p for p in set(before) | set(after)
                             if p not in patched and before.get(p) != after.get(p)))
 
-    def _decide(self, results, findings, changed) -> tuple[Verdict, Optional[FailureClass], str]:
+    def _decide(self, results, findings, changed, criteria=()) -> tuple[Verdict, Optional[FailureClass], str]:
         if findings:
             primary = next(c for c in REPAIR_PRIORITY if c in findings)
             culprit = next((r for r in results if r.finding == primary), None)
@@ -384,11 +408,16 @@ class VerificationEngine:
             return Verdict.NEEDS_REPAIR, primary, f"{primary.value}{where}"
         strong = [r for r in results if r.positive == "strong"]
         weak = [r for r in results if r.positive == "weak"]
-        if strong or weak:
-            basis = strong or weak
-            label = "strong" if strong else "weak"
+        if strong:
             return (Verdict.VERIFIED, None,
-                    f"{label} evidence: " + "; ".join(f"{r.command.id} {r.note}" for r in basis))
+                    "strong evidence: " + "; ".join(f"{r.command.id} {r.note}" for r in strong))
+        if criteria and all(c.status == "PASS" and "structural check" in c.notes for c in criteria):
+            return (Verdict.VERIFIED, None, "structural evidence: every acceptance criterion is a file that "
+                    "exists after the change (" + "; ".join(c.criterion for c in criteria) + ")")
+        if weak:
+            return (Verdict.UNVERIFIED, FailureClass.NO_VERIFICATION_EVIDENCE,
+                    "only weak evidence: " + "; ".join(f"{r.command.id} {r.note}" for r in weak)
+                    + " - no regression detected, but nothing shows the task was resolved")
         commands = self.state.verification_commands
         runnable = [r for r in results if r.comparison not in (Comparison.ENVIRONMENT, Comparison.NOT_COMPARABLE)]
         env = [r for r in results if r.comparison == Comparison.ENVIRONMENT]

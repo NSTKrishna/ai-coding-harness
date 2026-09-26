@@ -88,6 +88,20 @@ class LoadConfigTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_config({"AI_API_KEY": FAKE_KEY, "HARNESS_MAX_VERIFICATION_COMMANDS": "0"}, NO_DOTENV)
 
+    def test_m6_settings(self):
+        config = load_config({"AI_API_KEY": FAKE_KEY, "HARNESS_TARGETED_TESTS": "false", "HARNESS_VERIFY_FULL_SUITE": "0",
+                              "HARNESS_MAX_REPEATED_FAILURE_CYCLES": "4", "HARNESS_CONTEXT_COMPACTION_THRESHOLD": "9000",
+                              "HARNESS_TELEMETRY": "off", "HARNESS_RUNS_DIR": "/tmp/runs"}, NO_DOTENV)
+        self.assertEqual((config.limits.targeted_tests, config.limits.verify_full_suite,
+                          config.limits.max_repeated_failure_cycles), (False, False, 4))
+        self.assertEqual(config.context.compaction_threshold_chars, 9000)
+        self.assertEqual((config.telemetry_enabled, config.runs_dir), (False, Path("/tmp/runs")))
+        defaults = load_config({"AI_API_KEY": FAKE_KEY}, NO_DOTENV)
+        self.assertEqual((defaults.limits.targeted_tests, defaults.limits.verify_full_suite, defaults.telemetry_enabled,
+                          defaults.runs_dir), (True, True, True, None))
+        with self.assertRaises(ConfigError):
+            load_config({"AI_API_KEY": FAKE_KEY, "HARNESS_TELEMETRY": "maybe"}, NO_DOTENV)
+
     def test_invalid_limits_name_the_variable(self):
         for value in ("abc", "0", "-3", "1.5"):
             with self.subTest(value=value):

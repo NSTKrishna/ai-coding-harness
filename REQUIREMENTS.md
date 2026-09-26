@@ -122,8 +122,21 @@ Evidence (M4, 2026-09-26):
 
 - [x] Working context separated from permanent context
 - [x] Relevant files/snippets selected
-- [ ] Old observations can be summarized/compacted
-- [~] Repeated unnecessary context avoided
+- [x] Old observations can be summarized/compacted
+- [x] Repeated unnecessary context avoided
+
+Evidence (M6, 2026-09-26):
+- Compaction: deterministic, staged compaction of the executor request above
+  `compaction_threshold_chars` (stale content → duplicates → command tails → old observations
+  into typed `HistoryFact`s → shorter history → discovery evidence → old history facts), with no
+  model call (tests/test_m6_compaction.py, 6 tests). A long execution+repair history that reaches
+  14.3k chars uncompacted stays ≤ 12k with compaction, with the same outcome and the same model-call
+  count. Task, acceptance criteria, plan, current failure output, current diff and repair/failure
+  facts survive; stale file content never reappears.
+- Repeated context: identical working items are stored once (M3); stale observations and evidence
+  are removed after patches (M4); identical observations are shown once under compaction; protected
+  facts replace re-sending old history; an identical tool call + result 4 times in a row stops the
+  run as `no_progress` (`test_identical_executor_actions_are_stopped`).
 
 Evidence (M4, 2026-09-26):
 - Executor requests are rebuilt from bounded windows each step (6 observations, 20 history
@@ -190,6 +203,12 @@ autonomously yet (the agent loop is M3):
 - [x] Retry limit exists
 - [x] Infinite loops prevented
 
+Evidence (M6, 2026-09-26, additional):
+- Repeated-failure stop rule: the same failure signature after `max_repeated_failure_cycles`
+  repairs, or a repair that changed no file, ends the run UNVERIFIED with
+  `repeated_failure_no_progress` and no further model call (tests/test_m6_policy.py `NoProgressTest`).
+  A different failure resets the count.
+
 Evidence (M5, 2026-09-26):
 - Detected and classified deterministically: `CommandStatus` (PASS, TEST/BUILD/LINT/TYPECHECK
   failure, ENVIRONMENT_ERROR, TIMEOUT, TOOL_ERROR, NOT_RUN), baseline-vs-post `Comparison`, and
@@ -223,6 +242,11 @@ Evidence (M4, 2026-09-26) — bounded termination only, no recovery:
 - [x] Success based on evidence
 - [x] Failed verification triggers repair
 
+Evidence (M6, 2026-09-26, additional):
+- Stricter success policy: pass→pass (weak) evidence alone never yields VERIFIED; only fail→pass,
+  fewer failures with none new, or all-structural criteria do (`EvidencePolicyTest`, 4 tests; the
+  M5 regression scenario is now UNVERIFIED as intended).
+
 Evidence (M5, 2026-09-26):
 - Tests executed: only discovered commands, before editing (baseline) and after each execution
   or repair. `BASELINE_NOT_AVAILABLE` is recorded when none exists
@@ -248,8 +272,21 @@ Evidence (M5, 2026-09-26):
 - [x] Model calls tracked
 - [x] Tool calls tracked
 - [x] Context usage controlled
-- [ ] Targeted tests before full suite
-- [~] Expensive operations avoided when unnecessary
+- [x] Targeted tests before full suite
+- [x] Expensive operations avoided when unnecessary
+
+Evidence (M6, 2026-09-26):
+- Targeted tests: deterministic `TargetedCommand`s for unittest (method/module), pytest
+  (function/class/file) and go (package, `-run`), derived before the baseline from discovery and
+  the plan; any other framework records "framework selector could not be derived safely" and uses
+  the suite (tests/test_m6_targeting.py, 12 tests). The targeted command runs before the broad suite
+  at baseline and post-change (evidence order T1, V1, T1, V1).
+- Expensive operations avoided: the broad suite is skipped while the target still fails, or when
+  targeted evidence suffices by policy (`verify_full_suite=false`) — recorded as NOT_RUN with the
+  reason. Repeated-failure and no-progress rules stop repair loops before the repair budget
+  (e.g. 2 of 5 cycles used, remaining scripted responses untouched). Compaction uses no model
+  call. On a 1,005-file repository discovery reads 3 files (385 bytes) and the run stays bounded
+  (tests/test_m6_integration.py `ScaleTest`).
 
 Evidence (M5, 2026-09-26):
 - Verification needs no model call. It still runs when the model budget is exhausted, and only
@@ -326,6 +363,10 @@ Evidence (M1, 2026-09-26):
 - [x] reads AI_API_KEY
 - [x] no hardcoded credentials
 - [x] .env.example contains no real credential
+
+Evidence (M6, 2026-09-26, additional):
+- Run artifacts (31 files across 8 traced runs, 213 KB) contain no key; `test_no_secret_anywhere_and_bounded`
+  checks every artifact. `harness runs/report` need no key.
 
 Evidence (M5, 2026-09-26, additional):
 - With a fake key in the environment, the M5 trace across 11 scenarios found it in no RunState,
@@ -405,6 +446,8 @@ Evidence (M1, 2026-09-26):
   without ripgrep (2 skipped).
 - M5 (2026-09-26): same runs with 338 tests: all pass (2 ripgrep-only tests skipped without
   ripgrep). Still no runtime dependencies.
+- M6 (2026-09-26): same runs with 380 tests: all pass (2 skipped without ripgrep). Still no runtime
+  dependencies. Artifacts are never written into the target repository (`RunsDirTest`).
 
 ---
 

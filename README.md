@@ -3,12 +3,13 @@
 An autonomous software-engineering harness around a text-only foundation model.
 Architecture: [arch.md](arch.md). Status: [PROGRESS.md](PROGRESS.md).
 
-> Current state: milestone M5. A run goes discovery → plan → baseline (tests run before
-> any edit) → one-action-per-step execution → evidence-based verification → bounded
-> repair → re-verification, ending VERIFIED only on observed evidence (arch.md §4, §14–§16).
-> It is exercised end to end with a scripted model. No live model adapter exists yet (the
-> provider has not been announced), so `make run` accepts input and then stops with a
-> precise "provider not supported" message.
+> Current state: milestone M6 (final). A run goes discovery → plan → baseline (targeted test
+> first, then the discovered suite, before any edit) → one-action-per-step execution with
+> deterministic context compaction → evidence-based verification → bounded repair with a
+> repeated-failure stop rule → VERIFIED only on strong evidence. Every run writes artifacts
+> (`harness runs`, `harness report <id>`). It is exercised end to end with a scripted model;
+> no live model adapter exists yet (the provider has not been announced), so `make run`
+> accepts input and then stops with a precise "provider not supported" message.
 
 ## Requirements
 
@@ -53,6 +54,17 @@ Shows the repository profile (languages, manifests, test/build commands with the
 evidence for each) and, with a task, the ranked candidate files with reasons and
 discovery metrics. Makes no model call and does not modify the repository.
 
+## Run artifacts (no API key needed)
+
+Each `harness run` writes `events.jsonl`, `summary.json`, `final_report.md` and (for git
+repositories) `final.diff` to `.harness/runs/<run-id>/` in this checkout (or
+`HARNESS_RUNS_DIR`); never into the target repository.
+
+```sh
+PYTHONPATH=src .venv/bin/python -m harness runs
+PYTHONPATH=src .venv/bin/python -m harness report <run-id> [--json]
+```
+
 ## Configuration
 
 Set in the environment, or in a `.env` file in the directory you run from
@@ -66,6 +78,12 @@ Set in the environment, or in a `.env` file in the directory you run from
 | `AI_BASE_URL` | no | unset until organizers announce it |
 | `HARNESS_MAX_STEPS` | no | 40 |
 | `HARNESS_MAX_REPAIR_CYCLES` | no | 3 (0 = verify, never repair) |
+| `HARNESS_MAX_REPEATED_FAILURE_CYCLES` | no | 2 |
+| `HARNESS_TARGETED_TESTS` | no | true |
+| `HARNESS_VERIFY_FULL_SUITE` | no | true |
+| `HARNESS_CONTEXT_COMPACTION_THRESHOLD` | no | 60000 |
+| `HARNESS_TELEMETRY` | no | true |
+| `HARNESS_RUNS_DIR` | no | `.harness/runs` in this checkout |
 | `HARNESS_COMMAND_TIMEOUT_SECONDS` | no | 300 |
 | `HARNESS_MAX_MODEL_CALLS` | no | 60 |
 | `HARNESS_MAX_TOOL_CALLS` | no | 80 |

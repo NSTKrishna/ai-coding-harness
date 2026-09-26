@@ -70,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--top", metavar="N", type=int, default=10, help="candidates to show (default 10)")
     inspect.add_argument("--show-context", action="store_true",
                          help="also print the rendered working set a planner would receive")
+
+    runs = subcommands.add_parser("runs", help="list recent runs from their saved artifacts (no model, no API key)")
+    runs.add_argument("--limit", metavar="N", type=int, default=20, help="runs to show (default 20)")
+    report = subcommands.add_parser("report", help="show a saved run report (no model, no API key)")
+    report.add_argument("run_id", help="run id as listed by 'harness runs'")
+    report.add_argument("--json", action="store_true", help="print summary.json instead of final_report.md")
     return parser
 
 
@@ -93,6 +99,8 @@ def main(
         return EXIT_USAGE
     if args.command == "inspect":
         return _inspect(args, environ=environ, dotenv_path=dotenv_path, stdout=stdout, stderr=stderr)
+    if args.command in ("runs", "report"):
+        return _artifacts(args, environ=environ, dotenv_path=dotenv_path, stdout=stdout, stderr=stderr)
 
     try:
         config = load_config(environ=environ, dotenv_path=dotenv_path)
@@ -129,13 +137,23 @@ def _execute(config: Config, task_input: TaskInput, stdout: TextIO, stderr: Text
             f"harness inspect --repo {task_input.repo} --task \"...\""), file=stderr)
         return EXIT_USAGE
 
-    orchestrator = Orchestrator(model, limits=config.limits, context_limits=config.context, redact=config.redact)
+    recorder = None
+    if config.telemetry_enabled:
+        from harness.telemetry import RunRecorder, resolve_runs_dir
+        runs_dir, note = resolve_runs_dir(config.runs_dir, task_input.repo)
+        if note:
+            print(f"note: {note}", file=stderr)
+        recorder = RunRecorder(runs_dir, redact=config.redact)
+    orchestrator = Orchestrator(model, limits=config.limits, context_limits=config.context,
+                                redact=config.redact, recorder=recorder)
     try:
         state = orchestrator.run(task_input.repo, task_input.task)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=stderr)
         return EXIT_INTERRUPTED
     stdout.write(config.redact(format_run(state)))
+    if recorder is not None and recorder.run_dir is not None:
+        stdout.write(f"Run artifacts: {recorder.run_dir}\n")
     stdout.flush()
     return EXIT_OK if state.phase == Phase.VERIFIED else EXIT_NOT_VERIFIED
 
@@ -176,6 +194,48 @@ def _inspect(args: argparse.Namespace, *, environ: Optional[Mapping[str, str]], 
         if args.show_context:
             stdout.write(redact("\n--- working set ---\n" + result.working_set.render()))
     stdout.flush()
+    return EXIT_OK
+
+
+def _artifacts(args: argparse.Namespace, *, environ: Optional[Mapping[str, str]], dotenv_path: Optional[Path],
+               stdout: TextIO, stderr: TextIO) -> int:
+    """`harness runs` / `harness report`: read saved artifacts only (no key, no model, no repository)."""
+    import json
+    import re
+
+    from harness.config import load_runtime_settings
+    from harness.telemetry import list_runs, resolve_runs_dir
+
+    try:
+        _, configured = load_runtime_settings(environ=environ, dotenv_path=dotenv_path)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=stderr)
+        return EXIT_USAGE
+    runs_dir, _ = resolve_runs_dir(configured)
+    if args.command == "runs":
+        if args.limit < 1:
+            print("error: --limit must be at least 1", file=stderr)
+            return EXIT_USAGE
+        rows = list_runs(runs_dir, args.limit)
+        if not rows:
+            stdout.write(f"No runs recorded in {runs_dir}\n")
+            return EXIT_OK
+        stdout.write(f"Runs in {runs_dir} (newest first):\n")
+        for r in rows:
+            task = (r["task"][0] if r["task"] else "")[:70]
+            stdout.write(f"  {r['run_id']}  {str(r['final_status']):<17} {r['started_at']}  {task}\n")
+        return EXIT_OK
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.run_id):
+        print(f"error: invalid run id {args.run_id!r}", file=stderr)
+        return EXIT_USAGE
+    path = runs_dir / args.run_id / ("summary.json" if args.json else "final_report.md")
+    if not path.is_file():
+        print(f"error: no saved {'summary' if args.json else 'report'} for run {args.run_id} in {runs_dir}", file=stderr)
+        return EXIT_USAGE
+    text = path.read_text(encoding="utf-8")
+    if args.json:
+        text = json.dumps(json.loads(text), indent=2, sort_keys=True) + "\n"
+    stdout.write(text)
     return EXIT_OK
 
 

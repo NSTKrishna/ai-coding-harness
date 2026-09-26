@@ -29,6 +29,7 @@ DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_MODEL_CALLS = 60
 DEFAULT_MAX_TOOL_CALLS = 80
 DEFAULT_MAX_VERIFICATION_COMMANDS = 3
+DEFAULT_MAX_REPEATED_FAILURE_CYCLES = 2
 
 API_KEY_VAR = "AI_API_KEY"
 PROVIDER_VAR = "AI_MODEL_PROVIDER"
@@ -40,6 +41,11 @@ COMMAND_TIMEOUT_VAR = "HARNESS_COMMAND_TIMEOUT_SECONDS"
 MAX_MODEL_CALLS_VAR = "HARNESS_MAX_MODEL_CALLS"
 MAX_TOOL_CALLS_VAR = "HARNESS_MAX_TOOL_CALLS"
 MAX_VERIFICATION_COMMANDS_VAR = "HARNESS_MAX_VERIFICATION_COMMANDS"
+MAX_REPEATED_FAILURE_VAR = "HARNESS_MAX_REPEATED_FAILURE_CYCLES"
+TARGETED_TESTS_VAR = "HARNESS_TARGETED_TESTS"
+VERIFY_FULL_SUITE_VAR = "HARNESS_VERIFY_FULL_SUITE"
+TELEMETRY_VAR = "HARNESS_TELEMETRY"
+RUNS_DIR_VAR = "HARNESS_RUNS_DIR"
 
 # Working-context limits for repository discovery (see ContextLimits).
 CONTEXT_LIMIT_VARS = {
@@ -48,6 +54,7 @@ CONTEXT_LIMIT_VARS = {
     "max_evidence_items": "HARNESS_MAX_EVIDENCE_ITEMS",
     "max_snippet_lines": "HARNESS_MAX_SNIPPET_LINES",
     "max_context_chars": "HARNESS_MAX_CONTEXT_CHARS",
+    "compaction_threshold_chars": "HARNESS_CONTEXT_COMPACTION_THRESHOLD",
 }
 
 REDACTED = "***"
@@ -72,6 +79,9 @@ class Limits:
     max_model_calls: int = DEFAULT_MAX_MODEL_CALLS    # planner + executor, failed attempts included
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS      # registry dispatches, failed ones included
     max_verification_commands: int = DEFAULT_MAX_VERIFICATION_COMMANDS  # per baseline/verification round
+    max_repeated_failure_cycles: int = DEFAULT_MAX_REPEATED_FAILURE_CYCLES  # same failure after N repairs -> stop
+    targeted_tests: bool = True       # derive a targeted test command and run it before the broad suite
+    verify_full_suite: bool = True    # also run the broad suite after a passing targeted test
 
 
 @dataclass(frozen=True)
@@ -83,6 +93,7 @@ class ContextLimits:
     max_evidence_items: int = 24     # snippets in the working set
     max_snippet_lines: int = 30      # lines per snippet
     max_context_chars: int = 24_000  # rendered working set, hard ceiling
+    compaction_threshold_chars: int = 60_000   # executor request size above which context is compacted
 
 
 @dataclass(frozen=True)
@@ -92,6 +103,8 @@ class Config:
     limits: Limits
     env_file: Optional[Path] = None
     context: ContextLimits = field(default_factory=ContextLimits)
+    telemetry_enabled: bool = True    # write run artifacts (see harness.telemetry)
+    runs_dir: Optional[Path] = None   # artifact root override; None = harness default location
 
     def redact(self, text: str) -> str:
         """Replace every occurrence of the API key in ``text``."""
@@ -207,10 +220,37 @@ def load_config(
             max_tool_calls=_positive_int(MAX_TOOL_CALLS_VAR, get(MAX_TOOL_CALLS_VAR), DEFAULT_MAX_TOOL_CALLS),
             max_verification_commands=_positive_int(MAX_VERIFICATION_COMMANDS_VAR, get(MAX_VERIFICATION_COMMANDS_VAR),
                                                     DEFAULT_MAX_VERIFICATION_COMMANDS),
+            max_repeated_failure_cycles=_positive_int(MAX_REPEATED_FAILURE_VAR, get(MAX_REPEATED_FAILURE_VAR),
+                                                      DEFAULT_MAX_REPEATED_FAILURE_CYCLES),
+            targeted_tests=_bool(TARGETED_TESTS_VAR, get(TARGETED_TESTS_VAR), True),
+            verify_full_suite=_bool(VERIFY_FULL_SUITE_VAR, get(VERIFY_FULL_SUITE_VAR), True),
         ),
         env_file=env_file,
         context=_context_limits(get),
+        telemetry_enabled=_bool(TELEMETRY_VAR, get(TELEMETRY_VAR), True),
+        runs_dir=Path(get(RUNS_DIR_VAR)).expanduser() if get(RUNS_DIR_VAR) else None,
     )
+
+
+def load_runtime_settings(
+    environ: Optional[Mapping[str, str]] = None,
+    dotenv_path: Optional[Path] = None,
+) -> tuple[bool, Optional[Path]]:
+    """(telemetry_enabled, runs_dir) without requiring the API key (for `harness runs/report`)."""
+    get, _ = _settings(environ, dotenv_path)
+    runs_dir = get(RUNS_DIR_VAR)
+    return _bool(TELEMETRY_VAR, get(TELEMETRY_VAR), True), Path(runs_dir).expanduser() if runs_dir else None
+
+
+def _bool(name: str, raw: Optional[str], default: bool) -> bool:
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} must be true or false (got {raw!r})")
 
 
 def _positive_int(name: str, raw: Optional[str], default: int, *, allow_zero: bool = False) -> int:

@@ -9,6 +9,7 @@ M5-specific behaviour is tested in tests/test_verification*.py.
 """
 
 import json
+from dataclasses import replace
 import os
 import shutil
 import sys
@@ -49,6 +50,9 @@ class OrchestratorCase(unittest.TestCase):
         os.environ.pop("AI_API_KEY", None)   # scripted runs must not need a key
 
     def run_script(self, *script, limits=None, task=TASK, **kwargs):
+        # These tests pin the M5 verification command set (one suite, no targeted command) so the
+        # exact overhead constants hold; targeted tests are covered in tests/test_m6_*.py.
+        limits = replace(limits or Limits(), targeted_tests=False)
         self.model = ScriptedModel(list(script))
         self.state = Orchestrator(self.model, limits=limits, **kwargs).run(self.root, task)
         return self.state
@@ -185,7 +189,9 @@ class BudgetTest(OrchestratorCase):
         self.assertEqual(self.model.call_count, 0)
 
     def test_execution_requests_stay_bounded(self):
-        state = self.run_script(plan_response(), *[tool("read_file", path="src/math_utils.py")] * 30, complete(),
+        # distinct calls: 30 identical calls would (correctly) be stopped by the M6 no-progress rule
+        reads = [tool("read_range", path="src/math_utils.py", start_line=1, end_line=n) for n in range(1, 31)]
+        state = self.run_script(plan_response(), *reads, complete(),
                                 limits=Limits(max_steps=40, max_repair_cycles=0))
         sizes = [len(r.messages[1].content) for r in self.model.requests[1:]]
         self.assertEqual(state.steps, 31)

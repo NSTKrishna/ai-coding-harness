@@ -5,19 +5,22 @@
   (``max_evidence_items`` items, ``max_context_chars`` characters). When full,
   the lowest-priority item is evicted first (oldest first among equals).
   Identical content from the same source is stored once.
-- Episodic: short structured facts (e.g. "baseline tests: 3 failing"), kept in
-  order, deduplicated, capped at ``max_facts`` (oldest dropped first).
+- Episodic: typed facts (``context.facts``), kept in order, deduplicated, capped
+  at ``max_facts``. Protected kinds (verification, repair attempts, failures,
+  changes, decisions) are never evicted; other facts go oldest first.
 
-Compaction or summarization of old items is not implemented (arch.md §8).
+Compaction of the executor request lives in ``context.compaction`` (deterministic,
+no model call); it uses ``drop_working`` and ``drop_facts`` below.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Optional
 
 from harness.config import ContextLimits
+from harness.context.facts import PROTECTED_KINDS, fact_data
 from harness.context.working_set import WorkingSet
 
 TRUNCATION_MARK = "\n[... truncated to fit the working-context limit ...]"
@@ -45,6 +48,7 @@ class EpisodicFact:
     text: str
     source: Optional[str]
     seq: int
+    data: Mapping[str, Any] = field(default_factory=dict)   # structured fields of a typed fact
 
 
 class ContextManager:
@@ -103,17 +107,41 @@ class ContextManager:
         return before - len(self._items)
 
     # episodic ----------------------------------------------------------------
-    def record_fact(self, kind: str, text: str, source: Optional[str] = None) -> EpisodicFact:
+    def record_fact(self, kind: str, text: str, source: Optional[str] = None,
+                    data: Optional[Mapping[str, Any]] = None) -> EpisodicFact:
         for fact in self._facts:
             if fact.kind == kind and fact.text == text:
                 return fact
         self._seq += 1
-        fact = EpisodicFact(kind, text, source, self._seq)
+        fact = EpisodicFact(kind, text, source, self._seq, dict(data or {}))
         self._facts.append(fact)
         if len(self._facts) > self.max_facts:
-            self._facts.pop(0)
+            victim = next((f for f in self._facts if f.kind not in PROTECTED_KINDS), self._facts[0])
+            self._facts.remove(victim)
             self.facts_dropped += 1
         return fact
+
+    def record(self, fact, source: Optional[str] = None) -> EpisodicFact:
+        """Record a typed fact from ``context.facts``."""
+        return self.record_fact(fact.kind, fact.text(), source, fact_data(fact))
+
+    def drop_facts(self, kind: str, keep_last: int = 0) -> int:
+        """Drop facts of an unprotected ``kind``, oldest first, keeping the last ``keep_last``."""
+        if kind in PROTECTED_KINDS:
+            raise ValueError(f"{kind} facts are protected")
+        matching = [f for f in self._facts if f.kind == kind]
+        victims = matching[: max(len(matching) - keep_last, 0)]
+        self._facts = [f for f in self._facts if f not in victims]
+        self.facts_dropped += len(victims)
+        return len(victims)
+
+    def drop_working(self, kind: str, keep: int = 0) -> int:
+        """Drop working items of ``kind``, lowest priority first, keeping the best ``keep``."""
+        matching = sorted((i for i in self._items if i.kind == kind), key=lambda i: (-i.priority, i.seq))
+        victims = matching[keep:]
+        self._items = [i for i in self._items if i not in victims]
+        self.evicted += len(victims)
+        return len(victims)
 
     def facts(self, kind: Optional[str] = None) -> tuple[EpisodicFact, ...]:
         return tuple(f for f in self._facts if kind is None or f.kind == kind)

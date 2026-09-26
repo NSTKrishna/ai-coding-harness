@@ -215,9 +215,11 @@ class RunExecutionTest(CliTestCase):
     def run_with_model(self, script, provider="acme"):
         from unittest import mock
         from harness.model import ScriptedModel
+        self.runs_dir = self.tmp / "runs"      # never the project's own .harness/ during tests
         with mock.patch("harness.model.factory.create_model_client", return_value=ScriptedModel(script)):
             return self.run_cli(["run", "--repo", str(self.repo), "--task", "Fix add_one"],
-                                environ={"AI_API_KEY": FAKE_KEY, "AI_MODEL_PROVIDER": provider})
+                                environ={"AI_API_KEY": FAKE_KEY, "AI_MODEL_PROVIDER": provider,
+                                         "HARNESS_RUNS_DIR": str(self.runs_dir)})
 
     def test_run_is_verified_only_by_evidence(self):
         code, out, err = self.run_with_model(self.script)
@@ -227,6 +229,10 @@ class RunExecutionTest(CliTestCase):
         self.assertIn("TEST_FAILURE", out)       # baseline failed
         self.assertIn("FIXED", out)              # and the same command passes afterwards
         self.assertIn("Executor completion claim (not evidence): fixed add_one", out)
+        (run_dir,) = [d.resolve() for d in self.runs_dir.iterdir()]
+        self.assertIn(f"Run artifacts: {run_dir}", out)
+        self.assertEqual({p.name for p in run_dir.iterdir()},
+                         {"events.jsonl", "summary.json", "final_report.md", "final.diff"})
 
     def test_unverified_run_exit_code_and_wording(self):
         from harness.model import text_response

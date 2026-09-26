@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from harness.config import Limits
+from harness.context.compaction import ContextRenderer, ContextSnapshot
 from harness.context.manager import ContextManager
 from harness.model.types import Message, ModelError, ModelRequest
 from harness.orchestrator.observe import observe, summarize_arguments
@@ -46,6 +47,7 @@ class ExecutorSettings:
     observation_window: int = 6          # most recent observations shown in full
     max_observation_chars: int = 4_000   # per observation excerpt
     history_window: int = 20             # one-line action history entries shown
+    max_identical_actions: int = 4       # same tool call with the same result N times in a row -> no progress
 
 
 class Executor:
@@ -57,6 +59,9 @@ class Executor:
         self.limits = limits
         self.settings = settings or ExecutorSettings()
         self.redact = redact or (lambda text: text)
+        threshold = context.limits.compaction_threshold_chars
+        self.renderer = ContextRenderer(context, self.settings, threshold)
+        self.last_snapshot: Optional[ContextSnapshot] = None   # debug/test view of the last request
 
     def execute(self, state: RunState) -> None:
         """Run while ``state.phase`` is EXECUTE or REPAIRING."""
@@ -112,6 +117,14 @@ class Executor:
                 return
             observation = observe(step, call, result, self.settings.max_observation_chars)
             state.add_observation(observation)
+            repeats = self._identical_tail(state)
+            if repeats >= self.settings.max_identical_actions:
+                state.no_progress = True
+                state.transition(Phase.BLOCKED, f"no progress: {call.name} returned the same result {repeats} times in a row",
+                                 Failure("no_progress", f"{call.name} {observation.arguments_summary} repeated {repeats} "
+                                         f"times with an identical result",
+                                         {"no_progress": True, "tool": call.name, "repeats": repeats, "step": step}))
+                return
             if call.name == "apply_patch" and result.success:
                 self._after_patch(state, step, observation.affected_paths)
                 if state.changes is not None:
@@ -119,6 +132,20 @@ class Executor:
                     state.changes.record_patch(result.data.files, label)
 
     # ------------------------------------------------------------------------
+    @staticmethod
+    def _identical_tail(state: RunState) -> int:
+        """How many of the latest observations are the same call with the same result."""
+        obs = state.observations
+        if not obs:
+            return 0
+        key = (obs[-1].tool, obs[-1].arguments_summary, obs[-1].outcome, obs[-1].result_summary)
+        count = 0
+        for o in reversed(obs):
+            if (o.tool, o.arguments_summary, o.outcome, o.result_summary) != key:
+                break
+            count += 1
+        return count
+
     def _after_patch(self, state: RunState, step: int, paths) -> None:
         state.record_modified(paths)
         for path in paths:
@@ -130,42 +157,26 @@ class Executor:
                          Failure("budget", f"{budget} budget exhausted", {"budget": budget, "used": used, "limit": limit}))
 
     def build_request(self, state: RunState) -> ModelRequest:
-        """Bounded context: task, plan, repository evidence (minus stale files), short history,
-        the last few observations, remaining budgets and the tool list."""
+        """Bounded context: task, plan, repository evidence (minus stale files), verification and
+        repair state, short history, the last few observations, remaining budgets and the tool list.
+        Compacted deterministically when it exceeds the threshold (``context.compaction``)."""
         m = state.metrics
-        s = self.settings
         tools = self.registry.definitions()
         tool_lines = [f"- {t.name}: {t.description}\n  arguments: {json.dumps(t.parameters['properties'], sort_keys=True)}"
                       for t in tools]
-        history = state.action_history[-s.history_window:]
-        history_lines = [f"step {a.step}: {a.kind}" + (f" {a.tool} {a.arguments_summary}" if a.tool else "")
-                         for a in history]
-        obs_lines = []
-        for o in state.recent_observations(s.observation_window):
-            header = (f"### step {o.step}: {o.tool} {o.arguments_summary} -> "
-                      f"{'tool ok' if o.success else 'tool error'}, {o.outcome}"
-                      + (f", exit_code={o.exit_code}" if o.exit_code is not None else ""))
-            if o.stale:
-                body = f"[stale: {', '.join(o.affected_paths)} changed after this step; read it again]"
-            else:
-                body = o.result_summary
-            obs_lines += [header, body]
         remaining = (f"steps {self.limits.max_steps - state.steps + 1} (including this one), "
                      f"model calls {self.limits.max_model_calls - m.model_calls}, "
                      f"tool calls {self.limits.max_tool_calls - m.tool_calls}")
-        modified = ", ".join(state.modified_files) or "none"
-        sections = [
-            self.context.render().rstrip("\n"),   # task (capped), repository summary, current evidence
-            "# Plan\n" + (state.plan.render() if state.plan is not None else "none"),
-            "# Verification\n" + (state.verification_brief() or "no baseline information"),
-            f"# Files modified so far\n{modified}",
-            "# Action history\n" + ("\n".join(history_lines) or "none yet"),
-            "# Recent observations\n" + ("\n".join(obs_lines) or "none yet"),
-            f"# Remaining budget\n{remaining}",
-            "# Tools\n" + "\n".join(tool_lines),
-        ]
+        text, snapshot, record = self.renderer.render(
+            state, [f"# Remaining budget\n{remaining}", "# Tools\n" + "\n".join(tool_lines)])
+        self.last_snapshot = state.context_snapshot = snapshot
+        if record is not None:
+            state.emit("context_compacted", step=record.step, chars_before=record.chars_before,
+                       chars_after=record.chars_after, stages=list(record.stages),
+                       observations_dropped=record.observations_dropped, facts_retained=record.facts_retained,
+                       reached_limit=record.reached_limit)
         return ModelRequest(
-            messages=(Message("system", EXECUTOR_INSTRUCTIONS), Message("user", "\n\n".join(sections))),
+            messages=(Message("system", EXECUTOR_INSTRUCTIONS), Message("user", text)),
             tools=tools,
             max_output_tokens=EXECUTOR_MAX_OUTPUT_TOKENS,
             temperature=0.0,

@@ -27,3 +27,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Harness run artifacts (telemetry)
+.harness/

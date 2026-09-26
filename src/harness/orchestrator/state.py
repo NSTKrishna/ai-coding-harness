@@ -14,8 +14,9 @@ import enum
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
+from harness.context.compaction import CompactionState
 from harness.metrics import ExecutionMetrics
 
 
@@ -128,6 +129,12 @@ class RunState:
     changes: Any = None                    # verify.ledger.ChangeLedger
     repair_cycles: int = 0
     repair_context: Any = None             # verify.recovery.RepairContext while REPAIRING
+    repeated_failures: int = 0             # consecutive rounds with the same failure fingerprint (M6)
+    no_progress: bool = False              # a repair changed nothing and the failure stayed (M6)
+    targeting: Any = None                  # verify.targeting.TargetingResult (M6)
+    compaction: CompactionState = field(default_factory=CompactionState)   # M6
+    event_sink: Optional[Callable[[str, dict], None]] = field(default=None, repr=False)   # telemetry (M6)
+    context_snapshot: Any = field(default=None, repr=False)   # debug/test: ContextSnapshot of the last request
     failure: Optional[Failure] = None
     terminal_reason: Optional[str] = None
     transitions: list[Transition] = field(default_factory=list)
@@ -180,12 +187,18 @@ class RunState:
         if target not in allowed:
             raise InvalidTransition(f"{self.phase.value} -> {target.value} is not allowed")
         self.transitions.append(Transition(self.phase, target, reason, round(self.elapsed_seconds, 3)))
-        self.phase = target
+        source, self.phase = self.phase, target
         if failure is not None:
             self.failure = failure
         if target in TERMINAL:
             self.terminal_reason = reason[:MAX_SUMMARY_CHARS]
             self._clock_end = time.monotonic()
+        self.emit("phase_changed", source=source.value, target=target.value, reason=reason[:200])
+
+    def emit(self, event: str, **metadata) -> None:
+        """Forward a compact event to telemetry, if a recorder is attached."""
+        if self.event_sink is not None:
+            self.event_sink(event, metadata)
 
     def add_observation(self, observation: Observation) -> None:
         self.observations.append(observation)

@@ -31,6 +31,7 @@ from harness.repo.discovery import discover_for_task
 from harness.tools import build_registry
 from harness.tools.base import ToolContext, ToolLimits
 from harness.verify.commands import select_verification_commands
+from harness.verify.targeting import derive_targets
 from harness.verify.engine import Verdict, VerificationBudgetExhausted, VerificationEngine
 from harness.verify.ledger import ChangeLedger, EvidenceLedger
 from harness.verify.recovery import RecoveryController, RepairLimit
@@ -45,16 +46,22 @@ class Orchestrator:
     def __init__(self, model: ModelClient, *, limits: Optional[Limits] = None,
                  context_limits: Optional[ContextLimits] = None, tool_limits: Optional[ToolLimits] = None,
                  executor_settings: Optional[ExecutorSettings] = None,
-                 redact: Optional[Callable[[str], str]] = None) -> None:
+                 redact: Optional[Callable[[str], str]] = None, recorder=None) -> None:
+        """``recorder``: a ``telemetry.RunRecorder`` to write run artifacts; None writes nothing."""
         self.model = model
         self.limits = limits or Limits()
         self.context_limits = context_limits or ContextLimits()
         self.tool_limits = tool_limits_from(self.limits, tool_limits)
         self.executor_settings = executor_settings or ExecutorSettings()
         self.redact = redact
+        self.recorder = recorder
+        self._ctx: Optional[ToolContext] = None
 
     def run(self, repo: Path | str, task: str) -> RunState:
         state = RunState(task=task, repo_root=str(repo))
+        self._ctx = None
+        if self.recorder is not None:
+            self.recorder.start(state)
         try:
             self._run(state, repo, task)
         except Exception as exc:  # last line of defence: never leak a traceback to the caller
@@ -63,6 +70,12 @@ class Orchestrator:
                 message = self.redact(message) if self.redact else message
                 state.transition(Phase.INTERNAL_ERROR, f"internal error during {state.phase.value}",
                                  Failure("internal_error", message, {"phase": state.phase.value}))
+        finally:
+            if self.recorder is not None:
+                try:
+                    self.recorder.finish(state, self._ctx)
+                except OSError as exc:   # artifacts must never change the run's outcome
+                    state.terminal_reason = (state.terminal_reason or "") + f" (artifacts not written: {exc})"
         return state
 
     def _run(self, state: RunState, repo, task: str) -> None:
@@ -76,13 +89,20 @@ class Orchestrator:
             state.transition(Phase.BLOCKED, str(exc), Failure("invalid_input", str(exc)))
             return
         state.repo_root = str(ctx.root)
-        model = MeteredModelClient(self.model, ctx.metrics)
+        self._ctx = ctx
+        inner_model = self.recorder.wrap_model(self.model) if self.recorder is not None else self.model
+        model = MeteredModelClient(inner_model, ctx.metrics)
         registry = build_registry(ctx, redactor=self.redact)
+        if self.recorder is not None:
+            registry = self.recorder.wrap_registry(registry)
 
         # DISCOVER (deterministic, before any model call) -------------------------
         state.transition(Phase.DISCOVER, "intake accepted")
         discovery = discover_for_task(ctx.root, task, limits=self.context_limits, ctx=ctx)
         state.discovery = discovery
+        m = discovery.metrics
+        state.emit("discovery_completed", inventory_files=m.inventory_files, files_read=m.discovery_files_read,
+                   candidates=m.candidates, selected_files=m.selected_files, working_set_chars=m.working_set_chars)
         discovered = (*discovery.repo_profile.test_commands, *discovery.repo_profile.build_commands)
         commands = [resolve_command(c, ctx.root) for c in discovered]
         # The repository summary shows M3's unresolved spelling; accept it as the same command.
@@ -110,14 +130,23 @@ class Orchestrator:
         # BASELINING (deterministic, before any edit) -----------------------------
         state.transition(Phase.BASELINING, "plan accepted")
         state.evidence, state.changes = EvidenceLedger(), ChangeLedger()
+        def targets(base_commands):
+            state.targeting = derive_targets(ctx, discovery, state.plan, base_commands)
+            return state.targeting
+
         state.verification_commands = select_verification_commands(
-            state.plan, discovery.repo_profile, ctx.root, self.limits.max_verification_commands)
+            state.plan, discovery.repo_profile, ctx.root, self.limits.max_verification_commands,
+            derive_targets=targets if self.limits.targeted_tests else None)
         engine = VerificationEngine(registry, state, self.limits, state.evidence, state.changes)
         try:
             state.baseline = engine.baseline()
         except VerificationBudgetExhausted as exc:
             self._budget(state, "tool_calls", exc.used, exc.limit, "baseline")
             return
+        state.emit("baseline_completed", available=state.baseline.available,
+                   commands=[f"{r.command.id}={r.classification.status.value}" for r in state.baseline.runs],
+                   targeted=[c.text for c in state.verification_commands if c.level == "targeted"],
+                   targeting_unavailable=state.targeting.unavailable_reason if state.targeting else None)
 
         # EXECUTE ----------------------------------------------------------------
         state.transition(Phase.EXECUTE, f"baseline: {len(state.baseline.runs)} command(s) run")
@@ -137,6 +166,14 @@ class Orchestrator:
                 return
             state.verification_reports.append(report)
             recovery.record_verification(report)
+            state.emit("verification_completed", round=report.round, verdict=report.verdict.value,
+                       failure_class=report.failure_class.value if report.failure_class else None,
+                       summary=report.summary[:200])
+            stop = recovery.check_progress(report)
+            if stop is not None:
+                state.transition(Phase.UNVERIFIED, stop["reason"],
+                                 Failure("repeated_failure_no_progress", stop["reason"], stop["details"]))
+                return
             if report.verdict != Verdict.NEEDS_REPAIR:
                 target = {Verdict.VERIFIED: Phase.VERIFIED, Verdict.UNVERIFIED: Phase.UNVERIFIED,
                           Verdict.BLOCKED: Phase.BLOCKED}[report.verdict]
@@ -151,6 +188,8 @@ class Orchestrator:
                 self._budget(state, exc.budget, exc.used, exc.limit, "repair")
                 return
             state.transition(Phase.REPAIRING, f"repair cycle {state.repair_cycles} for {report.failure_class.value}")
+            state.emit("repair_started", cycle=state.repair_cycles, failure_class=report.failure_class.value,
+                       fresh_files=list(state.repair_context.fresh_files))
             executor.execute(state)
             state.repair_context = None if state.phase != Phase.REPAIRING else state.repair_context
 
