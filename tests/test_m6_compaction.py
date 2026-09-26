@@ -83,7 +83,10 @@ class CompactionIntegrationTest(unittest.TestCase):
         self.assertIn("Return x + 1", snap.plan_steps)
         self.assertIn("# Repair (cycle 1", snap.verification)                       # current failure retained
         self.assertIn("AssertionError: 4 != 2", snap.verification)
-        self.assertIn("-    return x + 2\n+    return x + 3", snap.verification)   # current diff retained
+        self.assertIn("-    return x + 2\n+    return x + 3", snap.verification)   # failing diff retained...
+        self.assertIn("Diff at verification round 1 (excerpt):", snap.verification)  # ...labelled by its round
+        self.assertNotIn("Current diff", snap.verification)                          # never presented as current
+        self.assertIn("NOTE: you have patched src/math_utils.py since verification round 1", snap.verification)
         kinds = {k for k, _ in snap.facts}
         self.assertTrue({"verification", "repair_attempt", "failure"} <= kinds)     # repair memory retained
         self.assertTrue(any(k == "failure" and "TASK_TEST_FAILURE" in t for k, t in snap.facts))  # not forgotten
@@ -95,6 +98,7 @@ class CompactionIntegrationTest(unittest.TestCase):
         repair_requests = [r.messages[1].content for r in self.model.requests if "# Repair (cycle" in r.messages[1].content]
         self.assertIn("### src/math_utils.py (current)\ndef add_one(x):\n    return x + 3", repair_requests[0])  # fresh
         self.assertNotIn("(current)", repair_requests[-1])     # invalidated again by the repair patch
+        self.assertNotIn("NOTE: you have patched", repair_requests[0])   # nothing patched yet in this cycle
         for text in repair_requests:
             working = text.split("## Working context")[1].split("# Plan")[0] if "## Working context" in text else ""
             self.assertNotIn("return x + 2", working)                                 # never stale content

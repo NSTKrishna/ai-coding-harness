@@ -111,7 +111,16 @@ class CompareTest(unittest.TestCase):
         b = self.c(run(1, stderr="error at line 12, took 0.93s"))      # only numbers differ
         c = self.c(run(1, stderr="a different error entirely"))
         self.assertEqual(compare(a, b), Comparison.UNCHANGED_FAILURE)
-        self.assertEqual(compare(a, c), Comparison.CHANGED_FAILURE)
+        self.assertNotEqual(a.fingerprint.output_hash, c.fingerprint.output_hash)
+        # AUDIT M3: without test ids a changed hash is noise (ordering, messages), not a regression
+        self.assertEqual(compare(a, c), Comparison.UNCHANGED_FAILURE)
+
+    def test_identified_failures_appearing_or_disappearing_is_a_change(self):
+        no_ids = self.c(run(1, stderr="Traceback: ImportError: cannot import name 'x'"))
+        with_ids = self.c(run(1, stderr="FAIL: test_a (tests.test_m.T)\nRan 1 test"))
+        self.assertTrue(with_ids.fingerprint.failing_tests)
+        self.assertEqual(compare(no_ids, with_ids), Comparison.CHANGED_FAILURE)
+        self.assertEqual(compare(with_ids, no_ids), Comparison.CHANGED_FAILURE)
 
 
 class LedgerTest(unittest.TestCase):

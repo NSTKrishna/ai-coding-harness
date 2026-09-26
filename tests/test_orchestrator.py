@@ -204,29 +204,70 @@ class MalformedOutputTest(OrchestratorCase):
         self.assertEqual(state.failure.kind, kind)
 
     def test_malformed_plan(self):
-        state = self.run_script(text_response("I will fix add_one."))
+        bad = text_response("I will fix add_one.")
+        state = self.run_script(bad, bad)                     # rejected, corrected once, rejected again
         self.assert_terminal(state, Phase.MODEL_ERROR, "invalid_plan")
-        self.assertEqual((state.steps, state.tool_calls), (0, 0))
+        self.assertEqual((state.steps, state.tool_calls, state.model_calls), (0, 0, 2))
+        retry = self.model.requests[1].messages
+        self.assertEqual([m.role for m in retry[-2:]], ["assistant", "user"])
+        self.assertIn("That plan was rejected", retry[-1].content)
+
+    def test_rejected_plan_is_corrected_once(self):
+        state = self.run_script(text_response("I will fix add_one."), plan_response(),
+                                tool("apply_patch", patch=FIX_PATCH), complete(), limits=NO_REPAIR)
+        self.assertEqual(state.phase, Phase.VERIFIED, state.terminal_reason)
 
     def test_plan_missing_field_and_wrong_type(self):
         from tests.orchestration_helpers import plan_dict
         partial = {k: v for k, v in plan_dict().items() if k != "steps"}
-        state = self.run_script(text_response(json.dumps(partial)))
+        state = self.run_script(text_response(json.dumps(partial)), text_response(json.dumps(partial)))
         self.assert_terminal(state, Phase.MODEL_ERROR, "invalid_plan")
         self.assertIn("steps", state.failure.message)
-        state = self.run_script(plan_response(files_to_inspect="src/math_utils.py"))
+        state = self.run_script(plan_response(files_to_inspect="src/math_utils.py"),
+                                plan_response(files_to_inspect="src/math_utils.py"))
         self.assert_terminal(state, Phase.MODEL_ERROR, "invalid_plan")
 
     def test_malformed_action_json(self):
-        state = self.run_script(plan_response(), text_response('{"action": "tool", "tool": "read_file",'))
+        bad = text_response('{"action": "tool", "tool": "read_file",')
+        state = self.run_script(plan_response(), bad, bad, bad)   # 2 answered with feedback, the 3rd is terminal
         self.assert_terminal(state, Phase.MODEL_ERROR, "invalid_action")
-        self.assertEqual(state.observations, [])                # nothing dispatched for the bad action
-        self.assertEqual(state.tool_calls, BASELINE_TOOLS)
+        self.assertEqual(state.tool_calls, BASELINE_TOOLS)       # nothing dispatched for the bad actions
+        self.assertEqual([o.outcome for o in state.observations], ["invalid_action", "invalid_action"])
+        self.assertEqual(state.model_calls, 4)
 
     def test_unknown_action(self):
-        state = self.run_script(plan_response(), text_response('{"action": "shell", "command": "rm -rf /"}'))
+        bad = text_response('{"action": "shell", "command": "rm -rf /"}')
+        state = self.run_script(plan_response(), bad, bad, bad)
         self.assert_terminal(state, Phase.MODEL_ERROR, "invalid_action")
         self.assertIn("unknown action 'shell'", state.failure.message)
+
+    def test_identical_repeat_is_annotated_and_still_stopped(self):
+        read = tool("read_file", path="src/math_utils.py")
+        state = self.run_script(plan_response(), read, read, read, read)
+        self.assert_terminal(state, Phase.BLOCKED, "no_progress")
+        notes = [o for o in state.observations if "[harness] Identical to the result of step" in o.result_summary]
+        self.assertEqual(len(notes), 3)                            # every repeat after the first read
+        self.assertIn("take a different action", self.model.requests[3].messages[1].content)
+
+    def test_passing_tests_after_a_change_suggest_completing(self):
+        state = self.run_script(plan_response(), tool("apply_patch", patch=FIX_PATCH),
+                                tool("run_tests", command=TEST_COMMAND), complete(), limits=NO_REPAIR)
+        self.assertEqual(state.phase, Phase.VERIFIED)
+        self.assertIn("If the task is done, call complete", self.model.requests[3].messages[1].content)
+
+    def test_low_step_budget_is_announced(self):
+        read = lambda n: tool("read_range", path="src/math_utils.py", start_line=1, end_line=n)
+        self.run_script(plan_response(), read(1), read(2), complete(), limits=Limits(max_steps=6, max_repair_cycles=0))
+        self.assertNotIn("Few steps remain", self.model.requests[1].messages[1].content)    # 6 steps left
+        self.assertIn("Few steps remain", self.model.requests[2].messages[1].content)       # 5 steps left
+
+    def test_invalid_reply_is_fed_back_and_the_run_recovers(self):
+        state = self.run_script(plan_response(), text_response("I will now fix the bug."),
+                                tool("apply_patch", patch=FIX_PATCH), complete(), limits=NO_REPAIR)
+        self.assertEqual(state.phase, Phase.VERIFIED, state.terminal_reason)
+        feedback = self.model.requests[2].messages[1].content    # the step after the invalid reply
+        self.assertIn("Your reply was not a valid action", feedback)
+        self.assertEqual([a.kind for a in state.action_history], ["invalid", "tool", "complete"])
 
     def test_native_malformed_arguments_are_a_structured_tool_error(self):
         state = self.run_script(plan_response(), malformed_tool_call_response("read_file", '{"path": '), complete(),
@@ -261,7 +302,10 @@ class MalformedOutputTest(OrchestratorCase):
         state = self.run_script(plan_response(), tool_call_response("read_file", {"path": "src/math_utils.py"}),
                                 tool("read_file", path="src/math_utils.py"), complete())
         self.assertEqual([a.source for a in state.action_history[:2]], ["native", "text"])
-        self.assertEqual([o.result_summary for o in state.observations][0], state.observations[1].result_summary)
+        from harness.orchestrator.executor import REPEAT_NOTE
+        first, second = state.observations[0].result_summary, state.observations[1].result_summary
+        self.assertEqual(first, second.split(REPEAT_NOTE)[0])      # same result by either route
+        self.assertIn(REPEAT_NOTE, second)
 
 
 class WiringTest(OrchestratorCase):
@@ -325,7 +369,8 @@ class WiringTest(OrchestratorCase):
         self.assertEqual(state.plan.verification_candidates[0].argv[0], PY)
 
     def test_invented_verification_command_is_rejected(self):
-        state = self.run_script(plan_response(verification_candidates=["pytest -q"]))
+        invented = plan_response(verification_candidates=["pytest -q"])
+        state = self.run_script(invented, invented)
         self.assertEqual(state.failure.kind, "invalid_plan")
 
     def test_chosen_verification_command_is_carried_in_the_plan(self):

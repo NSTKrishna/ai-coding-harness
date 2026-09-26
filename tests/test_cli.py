@@ -246,16 +246,25 @@ class RunExecutionTest(CliTestCase):
 
     def test_incomplete_run_exit_code(self):
         from harness.model import text_response
-        code, out, _ = self.run_with_model([text_response("not a plan")])
+        code, out, _ = self.run_with_model([text_response("not a plan")] * 2)
         self.assertEqual(code, 1)
         self.assertIn("MODEL_ERROR", out)
         self.assertIn("invalid_plan", out)
 
-    def test_unsupported_provider_is_reported_precisely(self):
+    def test_openai_compatible_without_model_or_endpoint_is_reported(self):
         code, out, err = self.run_cli(["run", "--repo", str(self.repo), "--task", "Fix add_one"],
-                                      environ={"AI_API_KEY": FAKE_KEY, "AI_MODEL_PROVIDER": "acme"})
+                                      environ={"AI_API_KEY": FAKE_KEY, "AI_MODEL_ADAPTER": "openai_compatible"})
         self.assertEqual(code, EXIT_USAGE)
-        self.assertIn("Configured model provider is not supported by this build: 'acme'", err)
+        self.assertIn("AI_MODEL and AI_BASE_URL", err)
+        self.assertNotIn(FAKE_KEY, out + err)
+        self.assertIn("return x + 2", (self.repo / "src" / "math_utils.py").read_text())
+
+    def test_unsupported_adapter_is_reported_precisely(self):
+        code, out, err = self.run_cli(["run", "--repo", str(self.repo), "--task", "Fix add_one"],
+                                      environ={"AI_API_KEY": FAKE_KEY, "AI_MODEL_ADAPTER": "acme"})
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("Configured model adapter is not supported by this build: 'acme'", err)
+        self.assertNotIn(FAKE_KEY, out + err)
         self.assertIn("harness inspect", err)
         self.assertIn("return x + 2", (self.repo / "src" / "math_utils.py").read_text())
 

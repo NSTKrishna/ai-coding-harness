@@ -89,7 +89,7 @@ class ScriptedModelTest(unittest.TestCase):
         self.assertIn('"name": "t"', encoded)
         self.assertEqual(
             {f.name for f in dataclasses.fields(ModelResponse)},
-            {"text", "tool_calls", "finish_reason", "usage", "provider", "model", "raw_finish_reason"},
+            {"text", "tool_calls", "finish_reason", "usage", "provider", "model", "raw_finish_reason", "metadata"},
         )
 
     def test_fake_usage_is_deterministic(self):

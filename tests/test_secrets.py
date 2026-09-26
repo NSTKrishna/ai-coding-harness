@@ -34,6 +34,12 @@ class SecretHandlingTest(RepoTestCase):
         self.assertNotIn("AI_API_KEY", data.stdout)
         self.assertNotIn(FAKE_KEY, data.stdout + data.stderr)
 
+    def test_child_processes_do_not_inherit_harness_python_path(self):
+        script = "import os; print(os.environ.get('PYTHONPATH'), os.environ.get('PYTHONHOME'))"
+        with mock.patch.dict(os.environ, {"PYTHONPATH": "/harness/src", "PYTHONHOME": "/harness/home"}):
+            data = self.registry.dispatch("run_command", {"command": [sys.executable, "-c", script]}).data
+        self.assertEqual(data.stdout.strip(), "None None")
+
     def test_key_in_repository_content_is_redacted_from_results(self):
         self.write("leaky.env", f"TOKEN={FAKE_KEY}\n")
         read = self.registry.dispatch("read_file", {"path": "leaky.env"})

@@ -55,6 +55,41 @@ class InterpreterResolutionTest(unittest.TestCase):
                 resolved = resolve_command(cmd(program, "-m", "pytest"), self.root, executable="/opt/py")
                 self.assertEqual(resolved.argv[0], "/opt/py")
 
+    def test_third_party_runner_prefers_an_interpreter_that_can_import_it(self):
+        found = {"python3": "/usr/bin/python3", "python": "/usr/bin/python"}
+        probed = []
+
+        def probe(path, module):
+            probed.append((path, module))
+            return path == "/usr/bin/python3"
+
+        resolved = resolve_command(cmd("python", "-m", "pytest", "-q"), self.root, executable="/opt/harness-venv/python",
+                                   which=found.get, probe=probe)
+        self.assertEqual(resolved.argv, ("/usr/bin/python3", "-m", "pytest", "-q"))
+        self.assertIn("can import pytest", resolved.reason)
+        self.assertEqual(probed, [("/opt/harness-venv/python", "pytest"), ("/usr/bin/python3", "pytest")])
+
+    def test_no_interpreter_can_import_the_runner_keeps_the_harness_interpreter(self):
+        resolved = resolve_command(cmd("python", "-m", "pytest"), self.root, executable="/opt/py",
+                                   which={"python3": "/usr/bin/python3"}.get, probe=lambda p, m: False)
+        self.assertEqual(resolved.argv[0], "/opt/py")   # verification then reports ENVIRONMENT_ERROR precisely
+
+    def test_stdlib_runner_and_repository_venv_are_not_probed(self):
+        def probe(path, module):
+            raise AssertionError("must not probe")
+
+        self.assertEqual(resolve_command(cmd("python", "-m", "unittest"), self.root, executable="/opt/py",
+                                         probe=probe).argv[0], "/opt/py")
+        self.make_venv()
+        self.assertEqual(resolve_command(cmd("python", "-m", "pytest"), self.root, probe=probe).argv[0],
+                         ".venv/bin/python")
+
+    def test_real_probe(self):
+        from harness.orchestrator.interpreter import can_import
+        self.assertTrue(can_import(sys.executable, "json"))
+        self.assertFalse(can_import(sys.executable, "no_such_module_xyz_123"))
+        self.assertFalse(can_import("/nonexistent/python", "json"))
+
     def test_other_commands_untouched(self):
         for argv in (("npm", "test"), ("make", "test"), ("go", "test", "./..."), ("pythonic-tool", "run")):
             with self.subTest(argv=argv):
