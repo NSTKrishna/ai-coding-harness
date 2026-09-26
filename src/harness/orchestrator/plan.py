@@ -13,7 +13,7 @@ The model can choose among them but cannot invent one.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional, Sequence
 
 from harness.model.types import Message, ModelError, ModelRequest
@@ -196,23 +196,38 @@ def build_planner_request(task: str, discovery, commands: Sequence[CommandCandid
     )
 
 
+PLAN_ATTEMPTS = 2   # a rejected plan is answered once with the exact error (a new, counted model call)
+
+
 class Planner:
-    def __init__(self, model) -> None:
+    def __init__(self, model, attempts: int = PLAN_ATTEMPTS) -> None:
         self.model = model   # a MeteredModelClient, so every call is counted
+        self.attempts = max(1, attempts)
 
     def create_plan(self, task: str, discovery, commands: Sequence[CommandCandidate],
                     aliases: Optional[Mapping[str, CommandCandidate]] = None) -> TaskPlan:
-        """Raises ``PlanError`` for rejected output and ``ModelError`` for any failed model call
-        (an unexpected adapter exception is wrapped, as the executor does)."""
-        try:
-            response = self.model.generate(build_planner_request(task, discovery, commands))
-        except ModelError:
-            raise
-        except Exception as exc:
-            raise ModelError(f"model call raised {exc.__class__.__name__}: {exc}") from exc
-        if response.tool_calls:
-            raise PlanError("the planner must answer with a JSON plan, not a tool call")
-        return parse_plan(response.text, commands, aliases)
+        """Raises ``PlanError`` for rejected output (after ``attempts`` tries) and ``ModelError`` for any
+        failed model call (an unexpected adapter exception is wrapped, as the executor does)."""
+        request = build_planner_request(task, discovery, commands)
+        for attempt in range(1, self.attempts + 1):
+            try:
+                response = self.model.generate(request)
+            except ModelError:
+                raise
+            except Exception as exc:
+                raise ModelError(f"model call raised {exc.__class__.__name__}: {exc}") from exc
+            try:
+                if response.tool_calls:
+                    raise PlanError("the planner must answer with a JSON plan, not a tool call")
+                return parse_plan(response.text, commands, aliases)
+            except PlanError as exc:
+                if attempt == self.attempts:
+                    raise
+                request = replace(request, messages=request.messages + (
+                    Message("assistant", response.text[:4_000] or "(no text)"),
+                    Message("user", f"That plan was rejected: {exc}. Reply with the corrected plan: exactly one "
+                                    f"JSON object with the required fields and limits, and nothing else.")))
+        raise AssertionError("unreachable")
 
 
 def plan_to_json(plan: TaskPlan) -> str:

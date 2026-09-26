@@ -37,11 +37,17 @@ class ParsePlanTest(unittest.TestCase):
         plan = parse_plan("```json\n" + json.dumps(plan_dict()) + "\n```", [])
         self.assertEqual(plan.understanding, "add_one adds 2 instead of 1.")
 
+    def test_single_plan_inside_prose_is_accepted(self):
+        # live models often write a sentence before (or after) the plan object
+        plan = parse_plan("Plan:\n" + json.dumps(plan_dict()) + "\nLet me know.", [])
+        self.assertEqual(plan.understanding, "add_one adds 2 instead of 1.")
+
     def test_rejections(self):
         cases = {
             "not json": ("Here is my plan: fix it", "not valid JSON"),
             "json array": ("[1, 2]", "expected a JSON object"),
-            "prose around json": ("Plan:\n" + json.dumps(plan_dict()), "not valid JSON"),
+            "two plans": ("Plan A:\n" + json.dumps(plan_dict()) + "\nPlan B:\n" + json.dumps(plan_dict(risks=["x"])),
+                          "2 JSON objects"),
             "missing field": (json.dumps({k: v for k, v in plan_dict().items() if k != "risks"}), "missing required field(s): risks"),
             "extra field": (json.dumps({**plan_dict(), "thoughts": "x"}), "unexpected field(s): thoughts"),
             "wrong type": (json.dumps(plan_dict(acceptance_criteria="add_one works")), "'acceptance_criteria' must be a list"),
@@ -94,7 +100,7 @@ class PlannerContextTest(unittest.TestCase):
         root = buggy_repo(self.base)
         discovery = discover_for_task(root, TASK)
         with self.assertRaises(PlanError):
-            Planner(ScriptedModel([tool_call_response("read_file", {"path": "x"})])).create_plan(TASK, discovery, [])
+            Planner(ScriptedModel([tool_call_response("read_file", {"path": "x"})] * 2)).create_plan(TASK, discovery, [])
         plan = Planner(ScriptedModel([text_response(json.dumps(plan_dict()))])).create_plan(TASK, discovery, [])
         self.assertEqual(plan.acceptance_criteria, ("add_one(1) returns 2",))
 
