@@ -80,8 +80,11 @@ class ModelRequest:
 
 @dataclass(frozen=True)
 class Usage:
+    """Token usage as reported by the provider; None means "not reported" (never estimated here)."""
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None   # part of input_tokens served from a provider cache
+    reasoning_tokens: Optional[int] = None      # part of output_tokens spent on hidden reasoning
 
 
 @dataclass(frozen=True)
@@ -93,11 +96,23 @@ class ModelResponse:
     provider: Optional[str] = None
     model: Optional[str] = None
     raw_finish_reason: Optional[str] = None  # provider's own label, for diagnostics
+    # Opaque, adapter-defined extras (e.g. response id, "provider_attempts"). The core only reads the
+    # documented "provider_attempts" key; never put secrets or hidden reasoning here.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 class ModelError(Exception):
-    """A model call failed. ``retryable`` marks transient failures (timeouts, 429, 5xx)."""
+    """A model call failed. ``retryable`` marks transient failures (timeouts, 429, 5xx).
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    ``kind`` is a stable label ("timeout", "connection", "rate_limit", "server_error",
+    "auth", "bad_request", "invalid_response", "error"); ``attempts`` is how many
+    transport attempts were made (adapters retry transient failures themselves).
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False, kind: str = "error",
+                 status_code: Optional[int] = None, attempts: int = 1) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.kind = kind
+        self.status_code = status_code
+        self.attempts = attempts

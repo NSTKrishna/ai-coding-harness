@@ -22,11 +22,12 @@ class MeteredModelClient:
     def generate(self, request: ModelRequest) -> ModelResponse:
         try:
             response = self.inner.generate(request)
-        except Exception:
-            self.metrics.record_model_call(failed=True)
+        except Exception as exc:
+            self.metrics.record_model_call(failed=True, attempts=getattr(exc, "attempts", 1))
             raise
         self.metrics.record_model_call(
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            attempts=int(response.metadata.get("provider_attempts", 1)),
         )
         return response
