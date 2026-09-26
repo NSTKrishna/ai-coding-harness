@@ -9,7 +9,7 @@
 > architecture is intentionally revised. Revisions are deliberate edits to this
 > file, recorded in PROGRESS.md.
 
-Status markers used below: **[M1]**…**[M4]** built in that milestone, **[planned]** designed but not built.
+Status markers used below: **[M1]**…**[M5]** built in that milestone, **[planned]** designed but not built.
 What is actually implemented and verified is tracked in PROGRESS.md and REQUIREMENTS.md, not here.
 
 ---
@@ -121,9 +121,9 @@ Software Engineering Task
 | Planner | `harness/orchestrator/plan.py` **[M4]** | One model call → strict JSON `TaskPlan` (revision planned) |
 | Executor | `harness/orchestrator/executor.py` **[M4]** | Bounded one-action-per-step model → tool → observation loop |
 | Tool registry | `harness/tools/` **[M2]** | Validated, confined, counted tool execution |
-| Verification engine | `harness/verify/verifier.py` | Decide PASS/FAIL/INCONCLUSIVE from evidence |
-| Evidence ledger | `harness/verify/ledger.py` | Append-only record of what was observed |
-| Failure recovery | `harness/verify/failures.py` | Classify failures and choose a recovery path |
+| Verification engine | `harness/verify/engine.py` **[M5]** | Baseline + post-change runs, comparison, verdict |
+| Evidence ledger | `harness/verify/ledger.py` **[M5]** | Append-only record of what was observed; change ledger |
+| Failure recovery | `harness/verify/outcomes.py`, `recovery.py` **[M5]** | Classify failures; bounded repair context |
 | Metrics | `harness/metrics.py` **[M2]** | Model/tool/command counters and token usage |
 | Telemetry | `harness/telemetry.py` [planned] | Event log and run report built on the metrics |
 
@@ -136,91 +136,74 @@ return results.
 
 # 4. Agent lifecycle / state machine
 
-**Built in M4** (`orchestrator/state.py`, `orchestrator/orchestrator.py`):
+**Built in M4–M5** (`orchestrator/state.py`, `orchestrator/orchestrator.py`):
 
 ```text
- INTAKE ──▶ DISCOVER ──▶ PLAN ──▶ EXECUTE ──complete──▶ READY_FOR_VERIFICATION
-   │            │          │         │
-   │            │          │         ├─blocked──────────▶ BLOCKED
-   │            │          │         ├─model/protocol───▶ MODEL_ERROR
-   │            │          │         ├─tool crash───────▶ TOOL_ERROR
-   │            │          ├─────────┴─budget───────────▶ BUDGET_EXHAUSTED
-   │            │          └─bad plan / model failure───▶ MODEL_ERROR
-   ├─invalid input──────────────────────────────────────▶ BLOCKED
-   └────────────┴─ unexpected exception ────────────────▶ INTERNAL_ERROR
+ INTAKE ─▶ DISCOVER ─▶ PLAN ─▶ BASELINING ─▶ EXECUTE ─complete─▶ READY_FOR_VERIFICATION ─▶ VERIFYING
+                                                ▲                         ▲                 │
+                                                │                         │                 ├─▶ VERIFIED
+                                                │                  REPAIRING ◀── NEEDS_REPAIR◀┤
+                                                │                (same Executor)            ├─▶ UNVERIFIED
+                                                │                                           └─▶ BLOCKED
+ abnormal terminals from the phases that can hit them:
+   BLOCKED (invalid input; model says blocked; environment makes verification impossible)
+   MODEL_ERROR (plan/action protocol, model call failure)   TOOL_ERROR (tool crash)
+   BUDGET_EXHAUSTED (steps, model calls, tool calls, repair cycles)   INTERNAL_ERROR (anything unexpected)
 ```
 
 | Phase | Does | Exits to |
 |---|---|---|
-| `INTAKE` | Check task non-empty, create the run's single `ToolContext` (root, limits, metrics) | `DISCOVER`, `BLOCKED` |
-| `DISCOVER` | M3 `discover_for_task(..., ctx=ctx)`; resolve Python interpreters of discovered commands (§6) | `PLAN` |
-| `PLAN` | Budget check, then one planner model call → `TaskPlan` (§10) | `EXECUTE`, `MODEL_ERROR`, `BUDGET_EXHAUSTED` |
-| `EXECUTE` | Executor loop (§12) | `READY_FOR_VERIFICATION` or an abnormal terminal |
-| `READY_FOR_VERIFICATION` | Terminal in M4. The executor *believes* it is done; nothing has been verified | — (M5: → `VERIFYING`) |
-| `BLOCKED`, `MODEL_ERROR`, `TOOL_ERROR`, `BUDGET_EXHAUSTED`, `INTERNAL_ERROR` | Terminal, with a structured `Failure(kind, message, details)` | — |
+| `INTAKE` | Check task; create the run's single `ToolContext` | `DISCOVER`, `BLOCKED` |
+| `DISCOVER` | M3 discovery on the shared context; resolve command interpreters | `PLAN` |
+| `PLAN` | Budget check, one planner call → `TaskPlan` | `BASELINING`, `MODEL_ERROR`, `BUDGET_EXHAUSTED` |
+| `BASELINING` | Select the verification command set; git snapshot; run the commands **before any edit**; snapshot again (§14) | `EXECUTE`, `BUDGET_EXHAUSTED` |
+| `EXECUTE` | Executor loop (§12) | `READY_FOR_VERIFICATION` or abnormal |
+| `READY_FOR_VERIFICATION` | The executor *claims* completion; nothing is decided yet | `VERIFYING` |
+| `VERIFYING` | VerificationEngine round: rerun commands, snapshot, diff, compare with baseline, assess criteria | `VERIFIED`, `UNVERIFIED`, `BLOCKED`, `NEEDS_REPAIR`, `BUDGET_EXHAUSTED` |
+| `NEEDS_REPAIR` | RecoveryController checks limits, re-reads changed files, builds the repair context | `REPAIRING`, `BUDGET_EXHAUSTED` |
+| `REPAIRING` | The same Executor with the repair context | `READY_FOR_VERIFICATION` or abnormal |
 
-`RunState.transition()` enforces the table; any other move raises
-`InvalidTransition`. `VERIFYING`, `VERIFIED` and `NEEDS_REPAIR` exist in the
-enum for M5, but no M4 transition reaches them. The orchestrator catches every
-exception, so a run always ends in a terminal phase instead of a traceback.
-
-**Target lifecycle (M5+) [planned]:**
-
-```text
- … EXECUTE ──▶ READY_FOR_VERIFICATION ──▶ VERIFYING ──pass──▶ VERIFIED
-                    ▲                          │
-                    └──── fix / replan ── NEEDS_REPAIR ◀──fail─┘
-```
-
-`VERIFYING` runs the verification engine (§14). `NEEDS_REPAIR` classifies the
-failure (§16) and re-enters `EXECUTE` or `PLAN` within `max_repair_cycles`. A
-baseline test run before editing is also planned for DISCOVER/M5.
+`RunState.transition()` enforces this table. `VERIFIED` is reachable only from
+`VERIFYING`; `NEEDS_REPAIR` cannot skip to `VERIFIED`, `EXECUTE` or `VERIFYING`; every
+repair ends in `READY_FOR_VERIFICATION` and is therefore verified again. The loop is
+bounded by `max_repair_cycles` (and the global budgets). The orchestrator catches every
+exception, so a run always ends in a terminal phase.
 
 ---
 
 # 5. RunState
 
-**[M4]** `orchestrator/state.py`, a mutable dataclass owned by the orchestrator:
+**[M4, extended M5]** `orchestrator/state.py`, a mutable dataclass owned by the orchestrator:
 
 ```python
 RunState(
     run_id, task, repo_root, phase,
     discovery: DiscoveryResult,        # repo_profile / working_set are views of it
     plan: TaskPlan,
-    observations: list[Observation],   # bounded (max_observations, oldest dropped, counted)
-    action_history: list[ActionRecord],# step, kind, tool, argument summary, native|text
+    observations: list[Observation],   # executor tool results; bounded, oldest dropped (counted)
+    action_history: list[ActionRecord],
     modified_files: list[str],         # unique, in order
-    steps: int,                        # executor iterations
-    failure: Failure | None,           # kind, message, details
-    terminal_reason: str | None,
-    transitions: list[Transition],     # source, target, reason, seconds since start
-    metrics: ExecutionMetrics,         # the run's shared counters (model/tool/command calls)
-    started_at, elapsed_seconds,
+    steps: int,                        # executor iterations (execution and repair)
+    completion_claims: list[(step, summary)],   # the model's "complete" summaries: never evidence
+    verification_commands, baseline, verification_reports,    # M5, §14
+    evidence: EvidenceLedger, changes: ChangeLedger,          # M5, §15
+    repair_cycles: int, repair_context: RepairContext | None, # M5, §16
+    failure, terminal_reason, transitions, metrics, started_at, elapsed_seconds,
 )
-Observation(step, tool, arguments_summary, success, outcome, result_summary,
-            affected_paths, exit_code, timed_out, error_code, stale)
 ```
 
 Rules:
 
-- **Single source of truth.** `model_calls`/`tool_calls` are properties reading the
-  shared `ExecutionMetrics` that `MeteredModelClient` and `ToolRegistry` update.
-  RunState keeps no second counter. The planner, executor and context manager
-  hold no copy of run state.
-- **Facts only.** Observations record tool, bounded argument summary, tool
-  success, outcome (`ok`, `tool_error`, `command_ok`, `command_failed`,
-  `command_timed_out`), a bounded excerpt, affected paths, exit code and timeout.
-  No model reasoning is stored. The only model text kept is the
-  `complete`/`blocked` summary the protocol asks for (≤ 500 characters).
-- **Staleness.** `invalidate_path(path, before_step)` marks earlier observations
-  of a patched file stale; stale observations are rendered as a "read it again"
-  marker, never as content.
-- `summary()` returns a frozen `RunSummary` (status, reason, failure, plan,
-  modified files, counts, recent observations). There is deliberately no
-  verification field.
-- It never contains the API key: tool results pass through the registry
-  redactor, and model summaries through the same redactor.
-- **[planned]** JSON serialization to the run directory at every transition (§19).
+- **Single source of truth.** `model_calls`/`tool_calls` read the one shared
+  `ExecutionMetrics`; counters are never reset between execution, verification and repair.
+- **Facts only.** Observations and evidence record what tools returned. The only model
+  text kept is the bounded `complete`/`blocked` summary, stored as a *claim*.
+- **Staleness.** A patch marks earlier observations of the file stale and removes its
+  working-set evidence (§12).
+- `summary()` → `RunSummary` (status, reason, failure, plan, modified files, counts, recent
+  observations, repair cycles, last `VerificationReport`).
+- It never contains the API key.
+- **[planned]** JSON serialization to a run directory (§19).
 
 ---
 
@@ -662,8 +645,10 @@ check budgets ─▶ build request ─▶ model.generate ─▶ parse_action ─
   whole patch is computed in memory; files are written only if every hunk of
   every file applies. Writes are atomic per file (temp file + `os.replace`); if a
   write fails midway, files already written are restored.
-- **Snapshots [planned].** Original contents of every touched file are kept in a
-  run-level `PatchRecord` for rollback across patches.
+- **Change attribution [M5].** `PatchedFile` carries `before_sha256`/`after_sha256`; the run's
+  `ChangeLedger` records, per file, the hash before the run's first patch, the current hash,
+  the phases that touched it (`execute`, `repair-1`, …) and the patch count. There is no
+  rollback: repairs are forward patches, and the harness never runs `git reset/checkout/clean`.
 - **Post-apply checks.** Python files are compiled (`compile()`) to catch syntax
   errors immediately; the result goes to the ledger.
 - **No commits.** The harness never runs `git commit`, `git push`, `git reset --hard`,
@@ -673,70 +658,133 @@ check budgets ─▶ build request ─▶ model.generate ─▶ parse_action ─
 
 # 14. Verification engine
 
-Runs in layers; later layers run only if earlier ones pass.
+**[M5]** `verify/engine.py`, `verify/commands.py`, `verify/outcomes.py`. Deterministic: no
+model call decides whether anything passed.
 
-1. **Static.** All patches applied; changed Python files compile; diff is non-empty.
-2. **Targeted tests.** Tests named in the task, tests paired with changed files,
-   and tests added by the run.
-3. **Broader tests.** The full suite (or the widest affordable subset if the
-   baseline showed the suite is too slow for the remaining budget).
-4. **Regression check against baseline.** A test that passed at baseline and fails
-   now is a regression. Failures that already existed at baseline are reported
-   but do not by themselves fail the run.
-5. **Diff review.** `git diff` is inspected for changes outside plan targets,
-   deleted or skipped tests, leftover debug output, and files that should not change
-   (lockfiles, CI config) unless the task asked for it.
-6. **Acceptance criteria.** Each criterion is mapped to evidence. Deterministic
-   mapping where possible (named test passes). Otherwise the model judges with the
-   evidence in front of it and must cite ledger ids; such checks are marked
-   lower confidence in the report.
+**Verification command set** (chosen once, after planning, before editing; `V1`, `V2` …):
+test commands the plan selected (purpose `task`); if none, the first discovered test
+command (purpose `suite`, a broad fallback); then one high-confidence build command, then
+high-confidence typecheck/lint (purpose `check`; `task` if the plan selected them).
+Commands come only from discovery (never invented), with resolved interpreters. At most
+`max_verification_commands` run per round; the rest are recorded `NOT_RUN`. Every run is a
+registry dispatch (`run_tests`/`run_command`) counted in `max_tool_calls`.
 
-Verdict: `PASS` (all layers pass, every criterion has evidence), `FAIL`
-(with a `FailureReport`), or `INCONCLUSIVE` (e.g. no test command found). An
-inconclusive verdict is never reported as success.
+**Baseline (BASELINING, before any edit).** Git snapshot (`git_status`, `git_diff_stat`,
+`git_diff`), run the command set, snapshot again (commands may create files). No command
+→ `BASELINE_NOT_AVAILABLE` (valid, recorded). A non-git repository gets no snapshots and
+no git tool calls. The working tree is never assumed clean and never cleaned.
+
+**Command classification** (`CommandStatus`): `PASS`, `TEST_FAILURE`, `BUILD_FAILURE`,
+`LINT_FAILURE`, `TYPECHECK_FAILURE`, `ENVIRONMENT_ERROR`, `TIMEOUT`, `TOOL_ERROR`, `NOT_RUN`.
+ENVIRONMENT_ERROR is conservative: executable missing, exit 126/127, the command's own
+`-m` module or a known framework (pytest, nose, mypy …) not installed, missing npm script
+or make target, make unable to exec a recipe (also as a sub-make). A missing *project*
+module is a code failure. Fingerprint = failing test ids (unittest 3.10/3.11+ normalized,
+pytest, go, cargo, jest/vitest) + a hash of the normalized output tail + tests-run count.
+
+**Baseline vs post-change** (same command id): `UNCHANGED_PASS`, `FIXED` (fail→pass),
+`IMPROVED` (fewer failing test ids, none new), `REGRESSED` (pass→fail/timeout),
+`UNCHANGED_FAILURE`, `CHANGED_FAILURE` (different/new failures), `ENVIRONMENT`,
+`NO_BASELINE`, `NOT_COMPARABLE`. Failures are compared by test ids when both sides have
+them, otherwise by normalized output hash — never by exit code alone.
+
+**Findings per command** (repairable `FailureClass`): REGRESSED → `REGRESSION`
+(`COMMAND_TIMEOUT` for a new timeout; build/lint/typecheck classes for checks);
+CHANGED_FAILURE → `REGRESSION`; UNCHANGED_FAILURE → `TASK_TEST_FAILURE` (or the check
+class) **only for purpose `task`** — for `suite`/`check` it is a pre-existing failure,
+reported, not blamed. The run also finds `DIFF_PROBLEM` when the plan has edit steps but
+the run changed no file.
+
+**Acceptance criteria** (`CriterionResult`: PASS / FAIL / UNKNOWN, evidence ids, notes).
+Deterministic and conservative: a criterion whose identifiers match a test id that
+failed at baseline and passes now → PASS (baseline + post evidence); matching a test that
+fails after the change → FAIL (a `TASK_TEST_FAILURE`); a criterion about a named file
+existing, when it exists → PASS (structural only). Everything else → UNKNOWN. The model's
+claim is never used. Each assessment is itself an `ACCEPTANCE_ASSESSMENT` evidence item.
+
+**Diff and attribution.** Final snapshot + diff are evidence. `changed_by_run` = files
+whose content now differs from before the run's first patch (ChangeLedger);
+`preexisting_changes` = paths dirty in the initial snapshot (not attributed);
+`changed_outside_patches` = paths whose status/diffstat changed between the
+after-baseline and final snapshots without a patch (reported as a risk).
+
+**Verdict policy** (`VerificationReport.verdict`), in order:
+
+1. **NEEDS_REPAIR** if any repairable finding exists (priority: DIFF_PROBLEM, REGRESSION,
+   TASK_TEST_FAILURE, BUILD, TYPECHECK, LINT, COMMAND_TIMEOUT) or any criterion is FAIL.
+2. **VERIFIED** if there is positive evidence and nothing above:
+   *strong* — a command FIXED or IMPROVED, or passes with more tests than at baseline;
+   *weak* — a plan-selected (`task`) test command passes before and after while the run
+   changed files (accepted; reported as the risk "may not exercise the change").
+   Pre-existing failures, commands not run and environment problems of other commands are
+   listed as risks, never hidden.
+3. **BLOCKED** if verification commands exist but none could run because of the
+   environment (e.g. the interpreter lacks the test framework): verification is impossible
+   here, and a code patch would not fix that. No repair is attempted.
+4. **UNVERIFIED** otherwise: no command exists (`NO_VERIFICATION_EVIDENCE`), or commands ran
+   but gave no positive evidence (only pre-existing failures, only unselected pass→pass,
+   timeouts on both sides, some environment errors).
+
+A run whose tool budget runs out before verification completes ends `BUDGET_EXHAUSTED`,
+never VERIFIED. There is no model-based criteria assessor.
 
 ---
 
 # 15. Evidence ledger
 
-Append-only list of `Evidence` records:
+**[M5]** `verify/ledger.py`. Append-only; ids `E1`, `E2` … sequential per run.
 
 ```python
-@dataclass
-class Evidence:
-    id: str                 # "E12"
-    kind: str               # baseline | test_run | command | patch | diff | syntax_check | criterion_check
-    summary: str            # one line, human-readable
-    passed: bool | None
-    artifact_path: str      # full output in the run directory
-    criteria: list[str]     # criterion ids this supports
-    after_patch: int        # index of the last patch applied when recorded
+EvidenceItem(id, kind, phase, source, description, command, command_id, exit_code,
+             result, path, excerpt, refs)
+kind ∈ TEST | BUILD | LINT | TYPECHECK | DIFF | FILE_CHANGE | BASELINE | ENVIRONMENT
+       | SNAPSHOT | ACCEPTANCE_ASSESSMENT
+phase ∈ "initial" | "baseline" | "after-baseline" | "post-1" | "post-2" | …
 ```
 
-Success requires: every acceptance criterion linked to passing evidence, and the
-test evidence recorded **after** the last patch. The final report lists the
-evidence ids that justify the outcome.
+Items are created only by `record_*` methods that take something the harness observed: a
+classified tool result (`record_command`), a git snapshot, a diff, a patch (via the
+ChangeLedger), a `NOT_RUN` decision, `BASELINE_NOT_AVAILABLE`, or an assessment whose `refs`
+must all exist (unknown refs raise). Nothing the model says becomes evidence; excerpts are
+bounded (1 500 chars for command output, 3 000 for diffs). Tests assert that every
+command evidence item corresponds to an actual `run_tests` dispatch.
+
+A repaired run's ledger reads as a causal history, e.g. initial snapshot → baseline
+TEST_FAILURE → post-1 TEST_FAILURE → criterion FAIL → post-2 PASS → criterion PASS.
 
 ---
 
 # 16. Failure recovery
 
-| Failure class | Detected by | Recovery |
-|---|---|---|
-| `PATCH_APPLY_FAILED` | applier | Re-read target region, retry edit (counts toward format retries) |
-| `SYNTAX_ERROR` | post-apply compile | Fix in place |
-| `TEST_FAILURE` | assertion failures in targeted tests | Fix in place with failure excerpt in context |
-| `TEST_ERROR` | import/collection errors | Fix in place; if in untouched files, rediscover |
-| `REGRESSION` | baseline comparison | Fix in place; if repeated, roll back the offending patch and replan |
-| `TIMEOUT` | command timeout | Narrow the test selection; if the baseline also timed out, stop |
-| `ENV_ERROR` | missing interpreter/command, permission errors | Stop (`FAILED`): editing code cannot fix the environment |
-| `MODEL_FORMAT_ERROR` | action parser | Reprompt with the protocol; then fail the step |
-| `NO_PROGRESS` | repeated identical actions or failure signatures | Replan once; then stop |
-| `BUDGET_EXHAUSTED` | budget tracker | Stop |
+**[M5]** `verify/outcomes.py` (classes), `verify/recovery.py` (RecoveryController).
 
-**Failure signature** = hash of (class, sorted failing test ids, normalized
-first error line). The same signature twice triggers a replan; three times stops
-the run.
+| FailureClass | Found when | Repairable |
+|---|---|---|
+| `TASK_TEST_FAILURE` | a `task` test still fails as before, or a criterion is FAIL | yes |
+| `REGRESSION` | pass→fail, or a failure changed / new failing tests appeared | yes |
+| `BUILD_FAILURE` / `LINT_FAILURE` / `TYPECHECK_FAILURE` | that check regressed (or is `task` and still fails) | yes |
+| `COMMAND_TIMEOUT` | passed before, times out now | yes |
+| `DIFF_PROBLEM` | edits were planned but no file changed | yes |
+| `ENVIRONMENT_ERROR` | nothing could run in this environment | no → BLOCKED/UNVERIFIED |
+| `NO_VERIFICATION_EVIDENCE` | no command or no positive result | no → UNVERIFIED |
+
+**Repair loop.** On `NEEDS_REPAIR`, before anything is spent: `repair_cycles <
+max_repair_cycles` (0 = verify, never repair) and a model call must remain; otherwise
+`BUDGET_EXHAUSTED` with `{budget: repair_cycles|model_calls, used, limit, phase: "repair"}`
+and no model call. Then the controller re-reads up to 3 changed files through `read_file`
+(ordinary tool calls) into working context as "current" items, replacing stale evidence,
+and builds a `RepairContext`: cycle, failure class and summary, failing command with
+baseline/post status and output tail, failing criteria, changed files, diff excerpt, prior
+verification/repair facts, and a warning if the last repair left an identical failure
+fingerprint. The same Executor and ToolRegistry run the repair (phase `REPAIRING`); the
+context is the only difference. `complete` → `READY_FOR_VERIFICATION` → verified again.
+
+**Repair memory.** Episodic facts in the ContextManager: `verification` (round, cycle,
+verdict, class, failing command fingerprint, changed files) and `repair_attempt` (cycle,
+failure, files). No reasoning is stored.
+
+**[planned]** Replanning, rollback of a failed attempt, and a stop rule for repeated
+identical failures (currently only a warning to the model).
 
 ---
 
@@ -745,7 +793,8 @@ the run.
 | Limit | Config key | Default |
 |---|---|---|
 | Executor steps (one model decision each) | `max_steps` **[M1]**, enforced **[M4]** | 40 |
-| Repair cycles | `max_repair_cycles` **[M1]** | 3 |
+| Repair cycles (0 = verify, never repair) | `max_repair_cycles` **[M1]**, enforced **[M5]** | 3 |
+| Verification commands per round | `max_verification_commands` **[M5]** (runs still count in `max_tool_calls`) | 3 |
 | Command timeout (seconds) | `command_timeout_seconds` **[M1]**, enforced by the command tools **[M2]**, wired from config into the run's `ToolLimits` **[M4]** | 300 |
 | Model calls (planner + executor, failures included) | `max_model_calls` **[M4]** | 60 |
 | Tool calls (every dispatch) | `max_tool_calls` **[M4]** | 80 |
@@ -756,8 +805,10 @@ the run.
 | Transient model API retries | `max_model_retries` [planned] | 3 |
 | Wall-clock limit (seconds) | `max_wall_seconds` [planned] | 1 800 |
 
-The budget is checked before every state handler and every executor turn.
-Exhaustion ends the run in `FAILED` with a report of what was achieved.
+Budgets are global for the run: verification and repair consume the same `max_steps`,
+`max_model_calls` and `max_tool_calls` as execution, and counters are never reset. Every
+check happens before the operation that would exceed it; exhaustion ends the run in
+`BUDGET_EXHAUSTED` (never VERIFIED) with `{budget, used, limit[, phase]}`.
 
 **On failure** the working tree keeps the edits made so far and the report says
 clearly that they are unverified. A `--rollback-on-failure` flag [planned]
@@ -835,9 +886,11 @@ harness inspect --repo PATH [--task TEXT | --task-file FILE] [--top N] [--show-c
   "No model provider is configured …" or "Configured model provider is not
   supported by this build: '<name>' …", states that no model was called and
   the repository was not modified, points to `harness inspect`, and exits 2.
-  When an adapter exists, it runs the `Orchestrator` and prints the run
-  summary (terminal phase, meaning, counts, modified files, acceptance
-  criteria, verification candidates). It never claims verification.
+  When an adapter exists, it runs the `Orchestrator` and prints the task result
+  **[M5]**: terminal phase and meaning, files changed by the run, baseline results,
+  every verification round with comparisons, criteria and evidence ids, risks
+  (pre-existing failures, commands not run), the completion claim labelled "not
+  evidence", and resources. Success wording only for VERIFIED.
   ScriptedModel runs go through the orchestrator API in tests, not a CLI flag.
 - **[planned]** stdin task input, `make run` convenience variables, `--rollback-on-failure`,
   `--json` report output.
@@ -846,8 +899,8 @@ Exit codes:
 
 | Code | Meaning |
 |---|---|
-| 0 | Run reached `READY_FOR_VERIFICATION` (M4; not a verification verdict) |
-| 1 | Run ended in another terminal phase (M4); verification failed [planned M5] |
+| 0 | Run ended `VERIFIED` **[M5]** |
+| 1 | Run ended in any other terminal phase (UNVERIFIED, BLOCKED, NEEDS_REPAIR exhausted, errors) |
 | 2 | Usage, configuration or input error, including an unsupported/unset model provider |
 | 130 | Interrupted (Ctrl-C) |
 
@@ -866,10 +919,11 @@ already set in the environment.
 | `AI_MODEL` | `model.name` | no | unset (awaiting organizers) |
 | `AI_BASE_URL` | `model.base_url` | no | unset (awaiting organizers) |
 | `HARNESS_MAX_STEPS` | `limits.max_steps` | no | 40 |
-| `HARNESS_MAX_REPAIR_CYCLES` | `limits.max_repair_cycles` | no | 3 |
+| `HARNESS_MAX_REPAIR_CYCLES` | `limits.max_repair_cycles` (0 allowed **[M5]**) | no | 3 |
 | `HARNESS_COMMAND_TIMEOUT_SECONDS` | `limits.command_timeout_seconds` | no | 300 |
 | `HARNESS_MAX_MODEL_CALLS` | `limits.max_model_calls` **[M4]** | no | 60 |
 | `HARNESS_MAX_TOOL_CALLS` | `limits.max_tool_calls` **[M4]** | no | 80 |
+| `HARNESS_MAX_VERIFICATION_COMMANDS` | `limits.max_verification_commands` **[M5]** | no | 3 |
 | `HARNESS_MAX_ACTIVE_FILES` | `context.max_active_files` **[M3]** | no | 8 |
 | `HARNESS_MAX_CANDIDATES` | `context.max_candidates` **[M3]** | no | 25 |
 | `HARNESS_MAX_EVIDENCE_ITEMS` | `context.max_evidence_items` **[M3]** | no | 24 |
@@ -917,7 +971,7 @@ from child-process environments (§25).
 │   ├── context/              [M3] working_set.py, manager.py   (compaction.py planned)
 │   ├── orchestrator/         [M4] state.py, protocol.py, plan.py, observe.py, executor.py,
 │   │                              interpreter.py, orchestrator.py, report.py
-│   └── verify/               [planned] verifier.py, ledger.py, failures.py
+│   └── verify/               [M5] commands.py, outcomes.py, ledger.py, engine.py, recovery.py
 └── tests/
     ├── test_config.py        [M1]
     ├── test_cli.py           [M1]
@@ -930,6 +984,7 @@ from child-process environments (§25).
     ├── orchestration_helpers.py  [M4] buggy repository + scripted responses
     ├── test_run_state.py  test_planner.py  test_action_protocol.py  test_orchestrator.py   [M4]
     ├── test_interpreter.py  test_model_factory.py   [M4]
+    ├── test_verification_outcomes.py  test_verification.py   [M5]
     ├── fixtures/             [planned] templates for small target repositories
     └── e2e/                  [planned] full-loop tests with the fake model
 ```
@@ -994,6 +1049,9 @@ make run
   requires the result to be the root or inside it. Absolute paths are allowed only
   inside the root. `for_write=True` also rejects anything in `.git/`. Walkers never
   follow symlinks.
+- **No destructive repository operations [M5].** Verification and repair never run
+  `git reset`, `git checkout` or `git clean`; pre-existing user changes are preserved and
+  reported, not attributed to the run.
 - **Command execution [M2].** No implicit shell: commands are an argv list or a
   string split with POSIX `shlex` rules; a string containing shell operators
   (`| && ; > < & ( )` or newline) is rejected, not misinterpreted. A shell is used
@@ -1001,6 +1059,9 @@ make run
   checked by the same policy. Execution: `cwd` validated inside the repo, stdin
   closed, output to temp files and truncated (head 40% / tail 60%), timeout capped
   by configuration, the whole process group killed on timeout, env scrubbed.
+  **[M5]** `PYTHONDONTWRITEBYTECODE=1` for run_command/run_tests: a `.pyc` written by the
+  baseline could otherwise be reused after a same-size edit made within the same second
+  (pyc validation uses whole-second mtime + size), making verification run stale code.
 - **Command policy [M2]** — deliberately small, a guardrail not a sandbox:
   - blocked programs: `sudo su doas pkexec shutdown reboot halt poweroff init
     telinit mkfs mkfs.* fdisk sfdisk cfdisk parted wipefs diskutil`;

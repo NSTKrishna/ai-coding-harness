@@ -28,6 +28,7 @@ DEFAULT_MAX_REPAIR_CYCLES = 3
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_MODEL_CALLS = 60
 DEFAULT_MAX_TOOL_CALLS = 80
+DEFAULT_MAX_VERIFICATION_COMMANDS = 3
 
 API_KEY_VAR = "AI_API_KEY"
 PROVIDER_VAR = "AI_MODEL_PROVIDER"
@@ -38,6 +39,7 @@ MAX_REPAIR_CYCLES_VAR = "HARNESS_MAX_REPAIR_CYCLES"
 COMMAND_TIMEOUT_VAR = "HARNESS_COMMAND_TIMEOUT_SECONDS"
 MAX_MODEL_CALLS_VAR = "HARNESS_MAX_MODEL_CALLS"
 MAX_TOOL_CALLS_VAR = "HARNESS_MAX_TOOL_CALLS"
+MAX_VERIFICATION_COMMANDS_VAR = "HARNESS_MAX_VERIFICATION_COMMANDS"
 
 # Working-context limits for repository discovery (see ContextLimits).
 CONTEXT_LIMIT_VARS = {
@@ -69,6 +71,7 @@ class Limits:
     command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS
     max_model_calls: int = DEFAULT_MAX_MODEL_CALLS    # planner + executor, failed attempts included
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS      # registry dispatches, failed ones included
+    max_verification_commands: int = DEFAULT_MAX_VERIFICATION_COMMANDS  # per baseline/verification round
 
 
 @dataclass(frozen=True)
@@ -195,26 +198,29 @@ def load_config(
         limits=Limits(
             max_steps=_positive_int(MAX_STEPS_VAR, get(MAX_STEPS_VAR), DEFAULT_MAX_STEPS),
             max_repair_cycles=_positive_int(
-                MAX_REPAIR_CYCLES_VAR, get(MAX_REPAIR_CYCLES_VAR), DEFAULT_MAX_REPAIR_CYCLES
-            ),
+                MAX_REPAIR_CYCLES_VAR, get(MAX_REPAIR_CYCLES_VAR), DEFAULT_MAX_REPAIR_CYCLES, allow_zero=True
+            ),  # 0 = verify but never repair
             command_timeout_seconds=_positive_int(
                 COMMAND_TIMEOUT_VAR, get(COMMAND_TIMEOUT_VAR), DEFAULT_COMMAND_TIMEOUT_SECONDS
             ),
             max_model_calls=_positive_int(MAX_MODEL_CALLS_VAR, get(MAX_MODEL_CALLS_VAR), DEFAULT_MAX_MODEL_CALLS),
             max_tool_calls=_positive_int(MAX_TOOL_CALLS_VAR, get(MAX_TOOL_CALLS_VAR), DEFAULT_MAX_TOOL_CALLS),
+            max_verification_commands=_positive_int(MAX_VERIFICATION_COMMANDS_VAR, get(MAX_VERIFICATION_COMMANDS_VAR),
+                                                    DEFAULT_MAX_VERIFICATION_COMMANDS),
         ),
         env_file=env_file,
         context=_context_limits(get),
     )
 
 
-def _positive_int(name: str, raw: Optional[str], default: int) -> int:
+def _positive_int(name: str, raw: Optional[str], default: int, *, allow_zero: bool = False) -> int:
+    what = "a non-negative integer" if allow_zero else "a positive integer"
     if raw is None:
         return default
     try:
         value = int(raw)
     except ValueError:
-        raise ConfigError(f"{name} must be a positive integer (got {raw!r})") from None
-    if value <= 0:
-        raise ConfigError(f"{name} must be a positive integer (got {raw!r})")
+        raise ConfigError(f"{name} must be {what} (got {raw!r})") from None
+    if value < 0 or (value == 0 and not allow_zero):
+        raise ConfigError(f"{name} must be {what} (got {raw!r})")
     return value

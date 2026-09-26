@@ -1,228 +1,234 @@
 # Implementation Progress
 
-Last updated: 2026-09-26 (M4 complete and verified; not committed)
+Last updated: 2026-09-26 (M5 complete and verified; not committed)
 
 ## Current milestone
 
-**M4 — Application/agent control layer: DONE, verified.**
-M5 has not started and waits for explicit go-ahead.
+**M5 — Baseline verification, VerificationEngine, EvidenceLedger, bounded repair: DONE, verified.**
+M6 has not started and waits for explicit go-ahead.
 
 ## Current repository state
 
-- Branch `main`.
-  - `34d0896` — M1.
-  - `d2c6e1a` — M2 + M3 checkpoint, committed at the start of M4 at the user's request
-    (234 tests passing, credential scan clean).
-  - M4 is uncommitted in the working tree on top of `d2c6e1a`.
-- M4 changes (`git status` against `d2c6e1a`):
-  - new: `src/harness/orchestrator/{__init__,state,protocol,plan,observe,executor,interpreter,orchestrator,report}.py`,
-    `src/harness/model/factory.py`, `tests/orchestration_helpers.py`, `tests/test_{run_state,planner,
-    action_protocol,orchestrator,interpreter,model_factory}.py`
-  - modified: `src/harness/cli.py` (run → model factory → orchestrator), `src/harness/config.py`
-    (`max_model_calls`, `max_tool_calls`), `tests/test_cli.py`, `tests/test_config.py`, `arch.md`,
-    `README.md`, `.env.example`, `REQUIREMENTS.md`, `PROGRESS.md`
-  - **No M2 or M3 source file changed** (`git diff` over `tools/ repo/ context/ metrics.py
-    model/client.py model/types.py` is empty).
-- **Not built:** live provider adapter, verification engine, evidence ledger, failure
-  classification/repair/replan, compaction, run directory/report files.
+- Branch `main`: `34d0896` M1 · `d2c6e1a` M2+M3 · `a11b23a` M4 (committed at the start of M5 at the
+  user's request, after a clean credential scan) · M5 uncommitted on top.
+- M5 changes (against `a11b23a`):
+  - new: `src/harness/verify/{__init__,commands,outcomes,ledger,engine,recovery}.py`,
+    `tests/test_verification.py`, `tests/test_verification_outcomes.py`
+  - modified: `orchestrator/{state,executor,orchestrator,report}.py`, `cli.py`, `config.py`,
+    `tools/commands.py`, `tools/patch.py`, tests (`orchestration_helpers`, `test_orchestrator`,
+    `test_run_state`, `test_cli`, `test_config`, `test_commands`), `arch.md`, `README.md`,
+    `.env.example`, `REQUIREMENTS.md`, `PROGRESS.md`
+- **Not built:** live provider adapter, replanning, compaction, run directory/report files,
+  targeted (per-test) command selection.
 
-### M1 tests intentionally changed
+### Defects found and fixed during M5
 
-Nine M1 CLI tests asserted that accepted input exits 0 with "Harness skeleton ready". In M4,
-`harness run` continues to model execution. With no adapter it now prints the same accepted-input
-report, then `error: No model provider is configured …` / `… not supported by this build …`, and
-exits 2. The tests now assert that stricter behavior (input accepted and reported, precise provider
-error, "No model was called and the repository was not modified"). Their input-handling coverage
-is unchanged.
+1. **Stale Python bytecode made verification judge old code (M2 command layer).** The baseline test
+   run wrote `__pycache__/*.pyc`. The fix patch (`x + 2` → `x + 1`) had the same size and was
+   applied within the same second, and Python validates `.pyc` by whole-second mtime + size, so
+   the post-change run executed the pre-patch bytecode ("still fails exactly as before").
+   Fix: `run_command`/`run_tests` set `PYTHONDONTWRITEBYTECODE=1`, which also stops the harness
+   creating `__pycache__` in target repos. Regression test:
+   `test_same_size_edit_in_the_same_second_is_not_hidden_by_bytecode_cache`.
+2. **`HARNESS_MAX_REPAIR_CYCLES=0` was rejected (M1 config).** It was parsed as a positive integer,
+   but M5 needs 0 = "verify, never repair". It is now parsed as a non-negative integer (tested).
+3. **Sub-make output was not recognised as an environment error (found while writing M5).** Under
+   `make test`, the fixture's own `make test` runs as a sub-make and reports `make[1]: …`. The
+   pattern now accepts `make[N]:`. This matters because evaluators launch via `make run`.
+4. **Circular import `verify.commands` ↔ `orchestrator`**: resolved with a function-local import.
 
-## Gap analysis (after M4)
+### M4 tests intentionally changed
+
+M4 treated `READY_FOR_VERIFICATION` as terminal and PLAN → EXECUTE as direct. Since M5 every
+completed execution is baselined and verified, so:
+
+- transition lists include BASELINING / VERIFYING / verdicts;
+- tool-call totals add the fixture's fixed overhead (6 baseline + 4 per verification round, named
+  constants in `test_orchestrator.py`);
+- scripts that complete without the fix run with `max_repair_cycles=0`, so they end right
+  after verification instead of asking the scripted model for a repair;
+- the completion summary is now `state.completion_claims`, not `terminal_reason`;
+- "VERIFIED/NEEDS_REPAIR unreachable" became "VERIFIED only through VERIFYING" and "repair
+  cannot bypass verification".
+
+Each test keeps its original subject: one action per step, observation feedback, staleness,
+budgets checked before dispatch, and malformed output handling.
+
+## Gap analysis (after M5)
 
 | Req | Item | Status |
 |---|---|---|
-| R1 | Accept task; inspect repository; determine relevant files | IMPLEMENTED AND VERIFIED |
+| R1 | Accept, inspect, determine files, **verify modifications** | IMPLEMENTED AND VERIFIED |
 | R1 | Understand task; modify implementation | PARTIAL (scripted model only) |
-| R1 | Verify modifications | MISSING |
-| R2 | All four items | IMPLEMENTED AND VERIFIED |
-| R3 | Lifecycle; plan; execute | IMPLEMENTED AND VERIFIED |
-| R3 | Finish/terminate | PARTIAL (clean termination; no verified finish) |
-| R3 | Verify; repair | MISSING |
-| R4 | Working vs permanent; snippets selected | IMPLEMENTED AND VERIFIED |
-| R4 | Repeated context avoided | PARTIAL |
-| R4 | Compaction | MISSING |
-| R5 | All six items | IMPLEMENTED AND VERIFIED (driven end to end by the executor) |
-| R6 | Failed test detected; infinite loops prevented | PARTIAL (recorded / budget-bounded only) |
-| R6 | Classification; repair/replan; retry limit | MISSING |
-| R7 | All | MISSING |
-| R8 | Model calls, tool calls tracked; context usage controlled | IMPLEMENTED AND VERIFIED |
-| R8 | Expensive operations avoided | PARTIAL |
-| R8 | Targeted tests before full suite | MISSING |
+| R2 | All | IMPLEMENTED AND VERIFIED |
+| R3 | Lifecycle, plan, execute, **verify, repair, finish/terminate** | IMPLEMENTED AND VERIFIED |
+| R4 | Working vs permanent; snippets selected | VERIFIED; repeated context PARTIAL; compaction MISSING |
+| R5 | All | IMPLEMENTED AND VERIFIED |
+| R6 | **All five items** | IMPLEMENTED AND VERIFIED (repair path; replanning not implemented) |
+| R7 | **All five items** | IMPLEMENTED AND VERIFIED (criteria assessment conservative: often UNKNOWN) |
+| R8 | Calls tracked; context controlled | VERIFIED; expensive ops PARTIAL; targeted tests MISSING |
 | R9 | `make run` | PARTIAL (no live adapter); rest VERIFIED |
 | R10 | All | IMPLEMENTED AND VERIFIED |
 | R11 | Provider abstraction | VERIFIED; text-only / configurable PARTIAL |
-| R12 | Dependencies declared | VERIFIED; others PARTIAL |
+| R12 | Dependencies declared | VERIFIED; clean-env / docs PARTIAL |
 
 ## Missing P0 components
 
-1. ~~Scaffolding, config, CLI~~ (M1) · ~~model interface, tools~~ (M2) · ~~repository intelligence,
-   working set, context manager~~ (M3) · ~~RunState, planner, executor, orchestrator~~ (M4)
-2. Verification engine: baseline tests, layered verification, regression check, diff review,
-   acceptance-criteria mapping (R7)
-3. Evidence ledger (R7)
-4. Failure classification, repair/replan loop, `max_repair_cycles`, no-progress detection (R6)
-5. Compaction of old observations; "unchanged since" re-read marker (R4)
-6. Run directory / report files (R8, arch §19)
-7. Live provider adapter, once announced (R11, R9 `make run`)
+1. Live provider adapter, once announced (R11, R9 `make run`)
+2. Compaction of old observations; "unchanged since" re-read marker (R4)
+3. Targeted test selection before the full suite (R8)
+4. Run directory / report files (arch §19)
+5. (Quality) replanning and a stop rule for repeated identical repair failures (R6 beyond the checklist)
 
 ## Dependency ordering
 
 ```text
-M4 control layer (done) ─▶ M5 verification + ledger ─▶ M6 repair/replan loop ─▶ M7 report, compaction,
-                                                                                 live adapter, hardening
+M5 verification + repair (done) ─▶ M6 context compaction + targeted tests ─▶ M7 run report, live adapter,
+                                                                              clean-environment rehearsal
 ```
 
 ## Next 3 implementation milestones
 
-### M5 — Verification engine and evidence ledger (R7, R1 verify)
+### M6 — Context compaction and targeted verification (R4, R8)
 
-- READY_FOR_VERIFICATION → VERIFYING → VERIFIED | NEEDS_REPAIR (add the transitions)
-- Baseline test run before EXECUTE; targeted then broader tests from `plan.verification_candidates`
-  or discovered commands; regression check against baseline; `git_diff`/`git_diff_stat` review;
-  acceptance-criteria → evidence mapping; explicit INCONCLUSIVE when no command exists
-- Done when: scripted runs reach VERIFIED only with passing evidence after the last patch, and
-  NEEDS_REPAIR on a failing fix.
+- Deterministic compaction of old observations; "unchanged since step N" markers for re-reads
+- Targeted test commands (e.g. `-k`/test-id selection derived from failing ids or changed files),
+  run before the full suite; the full suite still decides VERIFIED
+- Done when: long runs keep a flat request size with compacted history, and verification runs
+  targeted tests first with exact tool accounting.
 
-### M6 — Failure recovery (R6, R3 repair)
+### M7 — Run report and CLI integration (R8, R9)
 
-- Failure classes and signatures, repair and replan paths, `max_repair_cycles`, no-progress detection
-- Done when: fail → repair → pass and stop-at-limit E2E tests pass.
+- Run directory (`events.jsonl`, `state.json`, `report.md`) with evidence ledger export
+- Done when: every scripted scenario leaves a complete, secret-free run directory.
 
-### M7 — Run report, compaction, CLI, submission hardening (R4, R8, R9, R12)
+### M8 — Live adapter and submission hardening (R9, R11, R12)
 
-- Run directory (`events.jsonl`, `state.json`, `report.md`), deterministic compaction, live
-  adapter once announced, clean-environment rehearsal.
+- The organizer-prescribed provider in `model/factory.ADAPTERS`; clean-environment rehearsal of
+  `make setup && make run`; Linux check.
 
 ## Completed
 
-- M1 (`34d0896`), M2 + M3 (`d2c6e1a`), M4 (2026-09-26, uncommitted).
+- M1 `34d0896`, M2+M3 `d2c6e1a`, M4 `a11b23a`, M5 (2026-09-26, uncommitted).
 
 ## Currently implementing
 
-Nothing. Awaiting go-ahead for M5.
+Nothing. Awaiting go-ahead for M6.
 
-## Verified — M4 evidence
+## Verified — M5 evidence
 
-macOS (Darwin 25.6.0), project root. Scripts: `<scratchpad>/verify_m4.sh` (build/test matrix)
-and `<scratchpad>/trace_m4.py` (ScriptedModel trace).
+macOS (Darwin 25.6.0), project root. Scripts: `<scratchpad>/verify_m5.sh` (build/test matrix)
+and `<scratchpad>/trace_m5.py` (scenario traces).
 
-| # | DoD item | Evidence | Result |
-|---|---|---|---|
-| 1 | Previous tests pass | all 234 pre-M4 tests pass (9 M1 CLI assertions updated to M4 behavior, above) | OK |
-| 2–3 | Typed RunState, enforced phases | `tests.test_run_state` (9): happy path, invalid moves, VERIFIED/NEEDS_REPAIR unreachable, terminals final | OK |
-| 4, 10 | Discovery wired, shared ToolContext | `test_discovery_runs_before_first_model_call_and_shares_the_tool_context`: order `[discover, plan]`, discovery ctx `is` registry ctx, `ctx.metrics is state.metrics` | OK |
-| 5 | Planner uses bounded WorkingSet | `test_planner_uses_the_m3_working_set`; `test_planner_receives_bounded_working_set_not_the_repository` (3,000-char limit, unrelated file content absent) | OK |
-| 6 | Structured plan | `tests.test_planner` (6; 13 rejection cases) | OK |
-| 7 | Native + text → same ToolCall path | `tests.test_action_protocol` (7); `test_native_and_text_tool_calls_both_dispatch` | OK |
-| 8–9 | One action per step; results update state | `test_one_action_per_model_call`, `test_each_observation_feeds_the_next_request` | OK |
-| 11–12 | Budgets and timeout from config | `BudgetTest` (7), `test_command_timeout_comes_from_configuration` | OK |
-| 13 | Authoritative counts | `test_counts_come_from_shared_metrics`; `RunState.model_calls/tool_calls` read `ExecutionMetrics` | OK |
-| 14–15 | Patch invalidation, modified files | `test_read_then_patch_then_complete`, `test_stale_working_set_evidence_is_removed_after_patch` | OK |
-| 16 | Command failure semantics | `test_failing_tests_are_a_successful_tool_call_with_a_failed_command` | OK |
-| 17 | Missing commands not invented | `test_missing_commands_are_stated_not_invented`, `test_invented_verification_command_is_rejected` | OK |
-| 18 | Portable interpreter | `tests.test_interpreter` (8); `test_planner_sees_resolved_interpreter_not_bare_python` | OK |
-| 19 | complete → READY_FOR_VERIFICATION only | integration tests; transition table; CLI says "NOT been verified" | OK |
-| 20 | Malformed output ends cleanly | `MalformedOutputTest` (9) | OK |
-| 21–22 | Offline ScriptedModel E2E, no key | `OrchestratorCase` removes `AI_API_KEY`; trace below | OK |
-| 23 | No live provider invented | `test_no_adapter_is_shipped`; `make run` → precise provider error | OK |
-| 24 | Offline setup | matrix below | OK |
+**Build/test matrix:** working tree `make clean && make setup && make test` → 0/0/0, `Ran 338 tests OK`;
+fresh copy Python 3.10.19 → 0/0 (338 OK); fresh copy offline (`PIP_NO_INDEX=1`, Python 3.12) → 0/0
+(338 OK, 1 offline warning); fresh copy without ripgrep → 0/0 (338, 2 skipped).
 
-**Build/test matrix** (`verify_m4.sh`): working tree `make clean && make setup && make test` → 0/0/0,
-`Ran 303 tests … OK`; fresh copy Python 3.10.19 → 0/0 (303 OK); fresh copy offline
-(`PIP_NO_INDEX=1`, Python 3.12) → 0/0 (303 OK, 1 offline warning); fresh copy without ripgrep → 0/0
-(303, 2 skipped).
+**Test count: 338** (303 before M5 + 35: test_verification 18, test_verification_outcomes 11,
+test_orchestrator +1, test_run_state +2, test_cli +1, test_config +1, test_commands +1).
 
-**Test count: 303** (234 before M4 + 69 new: run_state 9, planner 6, action_protocol 7,
-orchestrator 31, interpreter 8, model_factory 4, cli +3, config +1). Suite ≈ 16 s.
+| # | DoD item | Evidence |
+|---|---|---|
+| 1 | M1–M4 tests pass | 303 prior tests pass (M4 lifecycle assertions updated as described above) |
+| 2–3 | Baseline before editing; initial state captured | `test_baseline_runs_before_the_first_edit`, `test_dirty_repository_is_preserved_and_not_attributed` |
+| 4 | Only discovered commands | `select_verification_commands`; `test_no_verification_command_is_unverified`; M4 invented-command rejection |
+| 5–6 | Classified outcomes; environment ≠ code | `ClassifyTest` (5), `test_environment_error_blocks_without_repair` |
+| 7 | Baseline vs post comparison | `CompareTest` (2; 15 cases) |
+| 8–10 | Typed report, ledger, criteria linked or UNKNOWN | `VerificationReport`/`EvidenceLedger`; `LedgerTest` (3); criteria assertions in integration tests |
+| 11 | `complete` is never proof | `test_completion_claim_alone_is_not_evidence` |
+| 12–13 | First-pass VERIFIED; failure → NEEDS_REPAIR | `test_baseline_fail_then_post_pass_is_verified`, `RepairTest` |
+| 14–16 | Same Executor/Registry; concise evidence; fresh content | `test_repair_request_has_fresh_content_and_failure_evidence` |
+| 17–18 | Exact repair limit; every repair re-verified | `LimitTest` (0 and 1 cycles), trace (0/1/2), transition table tests |
+| 19 | Global budgets include verification/repair | exact totals in `RepairTest`; `test_no_tool_budget_left_for_verification_is_never_verified`; `test_no_model_budget_left_for_repair_but_verification_still_runs` |
+| 20 | No repair for environment errors | environment test: 3 model calls, 0 repairs |
+| 21 | No-command tasks never VERIFIED | `test_no_verification_command_is_unverified` |
+| 22 | Pre-existing vs new failures | `test_unrelated_failure_is_reported_not_blamed` (IMPROVED, risk lists `test_legacy_format`) |
+| 23–24 | Git/diff evidence; no destructive rollback | SNAPSHOT/DIFF/FILE_CHANGE items; no `git reset/checkout/clean` in `src/` (grep) |
+| 25–27 | Offline scripted repair; no key; no live provider | whole suite runs without `AI_API_KEY`; `ADAPTERS` empty |
+| 28 | Offline setup | matrix above |
 
-### ScriptedModel trace (`trace_m4.py`, 204-file repository, fake key present in the environment)
+### Scenario trace (`trace_m5.py`, fake key in the environment)
 
 ```text
-order:        discover_for_task -> model:plan -> model:step1 -> model:step2 -> model:step3 -> model:step4
-transitions:  DISCOVER -> PLAN -> EXECUTE -> READY_FOR_VERIFICATION
-repository:   204 files, 6,606 bytes; planner message 1,501 chars; working set 1,063 chars;
-              discovery read 1 candidate file; filler content in planner input: False
-step 1: read_file   success=True outcome=ok          stale=True  paths=[src/math_utils.py]
-step 2: apply_patch success=True outcome=ok          stale=False paths=[src/math_utils.py]
-step 3: run_tests   success=True outcome=command_ok  exit=0
-executor request sizes: [5336, 5539, 5601, 6218]
-math_utils evidence in working context after patch: False
-final: READY_FOR_VERIFICATION; steps=4 model_calls=5 tool_calls=3 command_calls=1 modified=[src/math_utils.py]
-fake key present anywhere in state/requests: False
-budget max_steps=3:       BUDGET_EXHAUSTED steps 3/3; model_calls=4 tool_calls=3; 3 scripted responses unused
-budget max_model_calls=3: BUDGET_EXHAUSTED model_calls 3/3; steps=2 tool_calls=2
-budget max_tool_calls=2:  BUDGET_EXHAUSTED tool_calls 2/2; steps=3 model_calls=4
+first-pass            VERIFIED          r1:VERIFIED[V1:FIXED]                               model=4 tool=12 repairs=0
+repair                VERIFIED          r1:NEEDS_REPAIR/TASK_TEST_FAILURE | r2:VERIFIED[V1:FIXED]   model=7 tool=19 repairs=1
+pre-existing-failure  VERIFIED          r1:VERIFIED[V1:IMPROVED]                            model=3 tool=11
+regression            VERIFIED          r1:NEEDS_REPAIR/REGRESSION[REGRESSED] | r2:VERIFIED[UNCHANGED_PASS, weak]   model=5 tool=17 repairs=1
+environment-error     BLOCKED           r1:BLOCKED/ENVIRONMENT_ERROR[V1:ENVIRONMENT]        model=3 tool=11 repairs=0
+no-verification       UNVERIFIED        r1:UNVERIFIED/NO_VERIFICATION_EVIDENCE              model=3 tool=7
+max_repair_cycles=0   BUDGET_EXHAUSTED  repair_cycles 0/0; 1 round;  model=3; 4 scripted responses unused
+max_repair_cycles=1   BUDGET_EXHAUSTED  repair_cycles 1/1; 2 rounds; model=5; 2 unused
+max_repair_cycles=2   BUDGET_EXHAUSTED  repair_cycles 2/2; 3 rounds; model=7; 0 unused
+model budget 3        BUDGET_EXHAUSTED  model_calls 3/3 in repair; verification round still ran
+tool budget 8         BUDGET_EXHAUSTED  tool_calls 8/8 in verification; no report, never VERIFIED
+fake key found anywhere (state, report, requests, evidence): False
 ```
 
-**Manual `make run`** (key set, no provider): prints the accepted input, then
-`error: No model provider is configured (AI_MODEL_PROVIDER is not set) …`, "No model was called and the
-repository was not modified", exit 2. With `AI_MODEL_PROVIDER=acme`: "Configured model provider is not
-supported by this build: 'acme' (supported: none yet)". Fake key in output: 0 occurrences.
-`harness inspect` still works with the key unset.
+Repair-run ledger (causal history): E1 initial snapshot CLEAN · E2 baseline TEST_FAILURE · E3
+after-baseline snapshot CLEAN · E4 post-1 TEST_FAILURE · E5 snapshot · E6 FILE_CHANGE (execute) · E7 DIFF ·
+E8 criterion FAIL (refs E4) · E9 post-2 PASS · E10 snapshot · E11 FILE_CHANGE (execute, repair-1; 2 patches)
+· E12 DIFF · E13 criterion PASS (refs E2, E9). Transitions: DISCOVER → PLAN → BASELINING → EXECUTE →
+READY_FOR_VERIFICATION → VERIFYING → NEEDS_REPAIR → REPAIRING → READY_FOR_VERIFICATION → VERIFYING → VERIFIED.
 
-**Credential scan** over tracked + untracked files: no matches.
+**git / credentials:** `git diff --stat` shows only the files listed above; the credential-pattern scan
+over tracked + untracked files found no matches; `grep` finds no `git reset|checkout|clean` in `src/`.
 
 ## Known issues / limitations
 
-- The step budget counts executor iterations only; the planner call counts toward
-  `max_model_calls`, not `max_steps`.
-- A tool budget of N allows N dispatches. If the model then chooses another tool, the run ends
-  `BUDGET_EXHAUSTED` without dispatching it (one model call is spent on that choice by design,
-  so the model can still `complete` right after its last allowed tool).
-- The profile summary in the repository context still shows M3's unresolved `python …` spelling.
-  The planner accepts it as an alias of the resolved command.
-- `sys.executable` (the harness interpreter) is the fallback when the repository has no virtualenv.
-  It will not have the target repository's dependencies (e.g. pytest). M5 must treat
-  "interpreter lacks the test framework" as an environment problem, not a code failure.
-- Executor window sizes (`ExecutorSettings`) are internal constants, not user configuration.
-- From earlier milestones: the command policy is a guardrail, not a sandbox; `make` echoes
-  `Error 2` after the harness's own message.
+- **Weak evidence can verify.** A plan-selected test command that passes before and after,
+  while the run changed files, is accepted as VERIFIED and reported with the risk "may not
+  exercise the change". The regression→repair scenario depends on this. An unselected fallback
+  suite that passes both times is not enough (UNVERIFIED).
+- **Suite fallback blames less.** When the plan selects no command, an unchanged failure of the
+  discovered suite is treated as pre-existing unless a criterion maps to a still-failing test
+  (then TASK_TEST_FAILURE). A task whose test name shares no identifier with its criteria can end
+  UNVERIFIED instead of NEEDS_REPAIR.
+- **Criteria matching is lexical** (criterion identifiers vs failing/fixed test ids). Most
+  natural-language criteria stay UNKNOWN; that is intentional.
+- **Environment heuristics are small.** Unusual tool errors are classified as code failures and
+  would trigger a repair attempt.
+- **Fixed verification overhead.** Every git run spends 3 + 2 + 3-per-round git tool calls on
+  snapshots, which counts toward `max_tool_calls`.
+- **No stop rule for repeated failures.** A repair that repeats an identical failure only produces
+  a warning in the next repair context; the run continues until `max_repair_cycles`.
+- **Suite-level commands only.** Verification runs whole suites; slow suites cost `command_timeout`
+  per round.
+- **`sys.executable` fallback interpreter** (from M4) usually lacks the target's dependencies. That
+  now correctly ends BLOCKED (ENVIRONMENT_ERROR) rather than in pointless repairs.
 
-## Notes for M5
+## Notes for M6
 
-- **Entry state:** `RunState` in `READY_FOR_VERIFICATION`. Add transitions
-  `READY_FOR_VERIFICATION → VERIFYING → VERIFIED | NEEDS_REPAIR` in `state.TRANSITIONS`; the enum
-  members already exist, so nothing else needs renaming.
-- **What to verify with:** `state.plan.verification_candidates` (chosen, resolved), falling back to
-  `state.repo_profile.test_commands` passed through `orchestrator.interpreter.resolve_command`. Either
-  can be empty; M5 must produce an explicit "no verification command" outcome, never invent one.
-- **What changed:** `state.modified_files` (patched files) and `git_diff`/`git_diff_stat` (these include
-  untracked new files). A baseline test run should happen before EXECUTE to separate pre-existing failures.
-- **What was claimed:** `state.plan.acceptance_criteria` and `state.terminal_reason` (the model's
-  complete summary). Neither is evidence.
-- **Command outcomes:** `Observation.outcome` distinguishes `command_ok` / `command_failed` /
-  `command_timed_out` from `tool_error`. Keep `success` (tool) and `outcome` (command) separate.
-- **Counts and budgets:** reuse `state.metrics` and the run's `ToolContext`/registry. Verification tool
-  calls count toward `max_tool_calls`, so decide whether verification gets its own budget.
-- **Unused so far:** `max_repair_cycles` (config) and `ContextManager.record_fact` (episodic facts;
-  a natural home for baseline results).
-- **Live model:** add an entry to `model/factory.ADAPTERS` once the provider is announced; nothing
-  else depends on the provider.
+- **Where things live:** `state.verification_commands` (V1…), `state.baseline`,
+  `state.verification_reports` (one per round), `state.evidence` (EvidenceLedger),
+  `state.changes` (ChangeLedger), `state.repair_cycles`, `state.completion_claims`.
+- **Compaction:** the executor request now also carries `# Verification` (baseline + repair
+  context). `RepairContext` excerpts are bounded (1 500 output, 2 000 diff). Compaction should
+  treat verification facts (`ContextManager` kinds `verification` and `repair_attempt`) as
+  permanent-ish, since they drive repair.
+- **Targeted tests:** `outcomes.failing_tests()` already extracts test ids per runner. A targeted
+  command can be derived from them, but must stay discovered or derived deterministically, never
+  invented, and must keep the same `VerificationCommand` id across baseline and post-change,
+  otherwise comparison breaks.
+- **Budget accounting:** verification uses `registry.dispatch` directly (no model), always checking
+  `max_tool_calls` first. Keep that pattern for any new verification step.
+- **Report files:** `format_run(state)` is the text report; `EvidenceItem`s and
+  `VerificationReport`s are frozen dataclasses (asdict-serializable, with enums as strings).
+- **Live adapter:** unchanged. One entry in `model/factory.ADAPTERS`.
 
 ## Important architectural decisions
 
-- (M4) One `ToolContext` per run (root, limits, metrics) shared by discovery, tools and the metered
-  model; config `command_timeout_seconds` flows into its `ToolLimits`.
-- (M4) Explicit phase table, with VERIFIED/NEEDS_REPAIR unreachable until M5. Every failure ends in a
-  terminal phase with a structured `Failure`, and no exception escapes `Orchestrator.run`.
-- (M4) Strict JSON protocols (plan and actions), whole-response only, no repair or retry. Native and
-  text tool calls converge on `ToolCall` → `ToolRegistry.dispatch_call`.
-- (M4) Budgets checked before the operation that would exceed them; exhaustion never costs an
-  extra model call.
-- (M4) Executor requests are rebuilt from bounded windows each step (not an accumulating conversation).
-- (M4) Tool errors are observations; only a tool crash (`internal_error`) is terminal.
-- (M4) The planner may only choose discovered verification commands; Python interpreters are
-  resolved as repository venv → `sys.executable` → PATH.
-- (M4) `harness run` fails precisely when no adapter exists; `ADAPTERS` is empty by design.
-- (M3) Repository intelligence owns scope; bounded working set; `inspect` needs no key.
+- (M5) Baseline runs after planning and before any edit; the same command ids are compared across
+  rounds; results are classified deterministically, and a model never decides pass/fail.
+- (M5) Verdict policy in arch.md §14: NEEDS_REPAIR on repairable findings; VERIFIED only with
+  positive evidence (strong, or weak and flagged); BLOCKED when the environment prevents every
+  command; otherwise UNVERIFIED. Budget exhaustion is never VERIFIED.
+- (M5) Pre-existing failures and dirty working trees are reported, not blamed, and never cleaned.
+  No destructive git operations; repairs are forward patches tracked in the ChangeLedger.
+- (M5) Repair reuses the M4 Executor/ToolRegistry with a bounded RepairContext and fresh file
+  reads, limited by `max_repair_cycles` checked before any model call.
+- (M5) Harness-run commands never write Python bytecode.
+- (M4) One ToolContext per run; strict JSON protocols; budgets checked before the operation.
+- (M3) Repository intelligence owns scope; bounded working set.
 - (M2) Pure-Python patching, no implicit shell, read-only git, single path boundary.
 - (M1) Python ≥ 3.10, stdlib only, `unittest`, `PYTHONPATH=src` in make targets.
 
@@ -232,12 +238,12 @@ supported by this build: 'acme' (supported: none yet)". Fake key in output: 0 oc
 export AI_API_KEY="..."
 make setup        # idempotent, works offline
 make run          # interactive; stops with a precise error until a live adapter exists
-make test         # 303 tests, offline, no key needed
+make test         # 338 tests, offline, no key needed
 make clean
 PYTHONPATH=src .venv/bin/python -m harness inspect --repo PATH [--task "TEXT"]
 ```
 
 ## Last successful test
 
-2026-09-26: `make clean && make setup && make test` gave 303 tests OK (Python 3.14.3); also 303 OK on
+2026-09-26: `make clean && make setup && make test` gave 338 tests OK (Python 3.14.3); also 338 OK on
 3.10.19, on 3.12 offline, and without ripgrep (2 skipped).

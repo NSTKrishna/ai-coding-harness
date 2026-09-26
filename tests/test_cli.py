@@ -219,13 +219,24 @@ class RunExecutionTest(CliTestCase):
             return self.run_cli(["run", "--repo", str(self.repo), "--task", "Fix add_one"],
                                 environ={"AI_API_KEY": FAKE_KEY, "AI_MODEL_PROVIDER": provider})
 
-    def test_run_reaches_ready_for_verification_without_claiming_success(self):
+    def test_run_is_verified_only_by_evidence(self):
         code, out, err = self.run_with_model(self.script)
         self.assertEqual(code, EXIT_OK, err)
-        self.assertIn("READY_FOR_VERIFICATION", out)
-        self.assertIn("the changes have NOT been verified yet", out)
-        self.assertIn("Modified files: src/math_utils.py", out)
-        self.assertNotIn("VERIFIED\n", out)
+        self.assertIn("TASK RESULT: VERIFIED", out)
+        self.assertIn("Files changed by this run: src/math_utils.py", out)
+        self.assertIn("TEST_FAILURE", out)       # baseline failed
+        self.assertIn("FIXED", out)              # and the same command passes afterwards
+        self.assertIn("Executor completion claim (not evidence): fixed add_one", out)
+
+    def test_unverified_run_exit_code_and_wording(self):
+        from harness.model import text_response
+        from tests.orchestration_helpers import complete, plan_response
+        (self.repo / "tests" / "test_math_utils.py").write_text("def test_x():\n    pass\n")  # no command discovered
+        code, out, _ = self.run_with_model([plan_response(), *self.script[1:]])
+        self.assertEqual(code, 1)
+        self.assertIn("TASK RESULT: UNVERIFIED", out)
+        self.assertIn("correctness could NOT be established", out)
+        self.assertNotIn("[pass]", out)
 
     def test_incomplete_run_exit_code(self):
         from harness.model import text_response

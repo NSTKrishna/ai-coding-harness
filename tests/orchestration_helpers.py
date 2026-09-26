@@ -57,3 +57,59 @@ def complete(summary: str = "add_one fixed"):
 
 def blocked(reason: str = "cannot continue"):
     return text_response(json.dumps({"action": "blocked", "reason": reason}))
+
+
+# ---------------------------------------------------------------------------
+# M5 fixtures
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+
+UNITTEST_CMD = f"{_sys.executable} -m unittest discover -s tests -t ."
+
+WRONG_PATCH = (   # compiles, still wrong: add_one(1) == 4
+    "--- a/src/math_utils.py\n+++ b/src/math_utils.py\n"
+    "@@ -1,2 +1,2 @@\n def add_one(x):\n-    return x + 2\n+    return x + 3\n"
+)
+REPAIR_PATCH = (
+    "--- a/src/math_utils.py\n+++ b/src/math_utils.py\n"
+    "@@ -1,2 +1,2 @@\n def add_one(x):\n-    return x + 3\n+    return x + 1\n"
+)
+SECOND_WRONG_PATCH = (
+    "--- a/src/math_utils.py\n+++ b/src/math_utils.py\n"
+    "@@ -1,2 +1,2 @@\n def add_one(x):\n-    return x + 3\n+    return x + 4\n"
+)
+
+# A repository whose tests pass; the task only asks for a docstring.
+PASSING_REPO = {
+    **BUGGY_REPO,
+    "src/math_utils.py": "def add_one(x):\n    return x + 1\n\n\ndef double(x):\n    return x * 2\n",
+    "tests/test_math_utils.py": (
+        "import unittest\n\nfrom src.math_utils import add_one, double\n\n\n"
+        "class MathTest(unittest.TestCase):\n"
+        "    def test_add_one(self):\n        self.assertEqual(add_one(1), 2)\n\n"
+        "    def test_double(self):\n        self.assertEqual(double(3), 6)\n"
+    ),
+}
+BREAK_DOUBLE_PATCH = (
+    "--- a/src/math_utils.py\n+++ b/src/math_utils.py\n"
+    "@@ -5,2 +5,3 @@\n def double(x):\n-    return x * 2\n+    \"\"\"Return twice x.\"\"\"\n+    return x * 3\n"
+)
+FIX_DOUBLE_PATCH = (
+    "--- a/src/math_utils.py\n+++ b/src/math_utils.py\n"
+    "@@ -6,2 +6,2 @@\n     \"\"\"Return twice x.\"\"\"\n-    return x * 3\n+    return x * 2\n"
+)
+
+# Plain assert tests (no unittest import, no pytest config): nothing to discover.
+NO_COMMAND_REPO = {
+    "src/__init__.py": "",
+    "src/math_utils.py": BUGGY_REPO["src/math_utils.py"],
+    "tests/test_math_utils.py": "from src.math_utils import add_one\n\n\ndef test_add_one():\n    assert add_one(1) == 2\n",
+}
+# The only discovered command needs a tool that does not exist.
+ENVIRONMENT_REPO = {**NO_COMMAND_REPO, "Makefile": "test:\n\tnonexistent_tool_xyz_123 --run tests\n"}
+
+LEGACY_TEST = (
+    "import unittest\n\n\nclass LegacyTest(unittest.TestCase):\n"
+    "    def test_legacy_format(self):\n        self.assertEqual('a-b', 'a_b')   # fails before and after\n"
+)

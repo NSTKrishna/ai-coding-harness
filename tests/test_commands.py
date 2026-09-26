@@ -161,6 +161,14 @@ class ExecuteTest(RepoTestCase):
         self.assertLess(len(data.stdout), 1100)
         self.assertGreater(data.stdout_bytes, 100_000)
 
+    def test_same_size_edit_in_the_same_second_is_not_hidden_by_bytecode_cache(self):
+        (self.repo / "mod.py").write_text("VALUE = 2\n")
+        check = [PY, "-c", "import mod; print(mod.VALUE)"]
+        self.assertEqual(self.run_cmd(check).stdout, "2\n")
+        (self.repo / "mod.py").write_text("VALUE = 1\n")          # same size, same second
+        self.assertEqual(self.run_cmd(check).stdout, "1\n")
+        self.assertFalse((self.repo / "__pycache__").exists())
+
     def test_command_not_found_is_structured(self):
         result = self.registry.dispatch("run_command", {"command": "definitely-not-a-real-command-xyz"})
         self.assertEqual(result.error.code, "command_not_found")

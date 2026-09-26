@@ -23,29 +23,40 @@ class Phase(str, enum.Enum):
     INTAKE = "INTAKE"
     DISCOVER = "DISCOVER"
     PLAN = "PLAN"
+    BASELINING = "BASELINING"
     EXECUTE = "EXECUTE"
     READY_FOR_VERIFICATION = "READY_FOR_VERIFICATION"
-    # abnormal terminals
+    VERIFYING = "VERIFYING"
+    NEEDS_REPAIR = "NEEDS_REPAIR"
+    REPAIRING = "REPAIRING"
+    # terminals
+    VERIFIED = "VERIFIED"
+    UNVERIFIED = "UNVERIFIED"
     BLOCKED = "BLOCKED"
     MODEL_ERROR = "MODEL_ERROR"
     TOOL_ERROR = "TOOL_ERROR"
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
-    # declared for M5; no transition leads here in M4
-    VERIFYING = "VERIFYING"
-    VERIFIED = "VERIFIED"
-    NEEDS_REPAIR = "NEEDS_REPAIR"
 
 
 _ABNORMAL = {Phase.BLOCKED, Phase.MODEL_ERROR, Phase.TOOL_ERROR, Phase.BUDGET_EXHAUSTED, Phase.INTERNAL_ERROR}
 
+# Every path to VERIFIED goes through VERIFYING; NEEDS_REPAIR can only lead to REPAIRING
+# (or stop), and REPAIRING can only lead back to READY_FOR_VERIFICATION (or stop).
 TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     Phase.INTAKE: frozenset({Phase.DISCOVER, Phase.BLOCKED, Phase.INTERNAL_ERROR}),
     Phase.DISCOVER: frozenset({Phase.PLAN, Phase.INTERNAL_ERROR}),
-    Phase.PLAN: frozenset({Phase.EXECUTE, Phase.MODEL_ERROR, Phase.BUDGET_EXHAUSTED, Phase.INTERNAL_ERROR}),
+    Phase.PLAN: frozenset({Phase.BASELINING, Phase.MODEL_ERROR, Phase.BUDGET_EXHAUSTED, Phase.INTERNAL_ERROR}),
+    Phase.BASELINING: frozenset({Phase.EXECUTE, Phase.BUDGET_EXHAUSTED, Phase.INTERNAL_ERROR}),
     Phase.EXECUTE: frozenset({Phase.READY_FOR_VERIFICATION} | _ABNORMAL),
+    Phase.READY_FOR_VERIFICATION: frozenset({Phase.VERIFYING, Phase.INTERNAL_ERROR}),
+    Phase.VERIFYING: frozenset({Phase.VERIFIED, Phase.UNVERIFIED, Phase.BLOCKED, Phase.NEEDS_REPAIR,
+                                Phase.BUDGET_EXHAUSTED, Phase.INTERNAL_ERROR}),
+    Phase.NEEDS_REPAIR: frozenset({Phase.REPAIRING, Phase.BUDGET_EXHAUSTED, Phase.INTERNAL_ERROR}),
+    Phase.REPAIRING: frozenset({Phase.READY_FOR_VERIFICATION} | _ABNORMAL),
 }
-TERMINAL = frozenset({Phase.READY_FOR_VERIFICATION} | _ABNORMAL)
+TERMINAL = frozenset({Phase.VERIFIED, Phase.UNVERIFIED} | _ABNORMAL)
+EXECUTING = frozenset({Phase.EXECUTE, Phase.REPAIRING})
 
 MAX_SUMMARY_CHARS = 500
 
@@ -108,6 +119,15 @@ class RunState:
     action_history: list[ActionRecord] = field(default_factory=list)
     modified_files: list[str] = field(default_factory=list)
     steps: int = 0
+    completion_claims: list[tuple[int, str]] = field(default_factory=list)   # (step, summary); never evidence
+    # verification (M5)
+    verification_commands: tuple = ()      # verify.commands.VerificationCommand
+    baseline: Any = None                   # verify.engine.BaselineResult
+    verification_reports: list = field(default_factory=list)   # verify.engine.VerificationReport per round
+    evidence: Any = None                   # verify.ledger.EvidenceLedger
+    changes: Any = None                    # verify.ledger.ChangeLedger
+    repair_cycles: int = 0
+    repair_context: Any = None             # verify.recovery.RepairContext while REPAIRING
     failure: Optional[Failure] = None
     terminal_reason: Optional[str] = None
     transitions: list[Transition] = field(default_factory=list)
@@ -140,6 +160,19 @@ class RunState:
     @property
     def is_terminal(self) -> bool:
         return self.phase in TERMINAL
+
+    @property
+    def last_report(self):
+        return self.verification_reports[-1] if self.verification_reports else None
+
+    def verification_brief(self) -> str:
+        """Baseline results (and the repair context while repairing) for the executor's request."""
+        parts = []
+        if self.baseline is not None:
+            parts.append(self.baseline.render())
+        if self.phase == Phase.REPAIRING and self.repair_context is not None:
+            parts.append(self.repair_context.render())
+        return "\n\n".join(parts)
 
     # mutation ------------------------------------------------------------------
     def transition(self, target: Phase, reason: str = "", failure: Optional[Failure] = None) -> None:
@@ -192,12 +225,15 @@ class RunState:
             steps=self.steps,
             recent_observations=tuple(self.recent_observations(5)),
             elapsed_seconds=round(self.elapsed_seconds, 3),
+            repair_cycles=self.repair_cycles,
+            verification=self.last_report,
         )
 
 
 @dataclass(frozen=True)
 class RunSummary:
-    """What a caller needs after a run. There is deliberately no verification verdict."""
+    """What a caller needs after a run. The verdict is the terminal status plus the last
+    VerificationReport; a completion claim by the model is never part of it."""
     run_id: str
     terminal_status: Phase
     terminal_reason: Optional[str]
@@ -210,3 +246,5 @@ class RunSummary:
     steps: int
     recent_observations: tuple[Observation, ...]
     elapsed_seconds: float
+    repair_cycles: int = 0
+    verification: Any = None      # last VerificationReport, if verification ran

@@ -14,7 +14,16 @@ Status:
 - [x] Inspect existing repository
 - [x] Determine relevant files
 - [~] Modify implementation
-- [ ] Verify modifications
+- [x] Verify modifications
+
+Evidence (M5, 2026-09-26):
+- Verify modifications: every completed execution is verified by the deterministic
+  VerificationEngine. The same discovered command runs before any edit (baseline) and after it,
+  and the outcomes are compared (tests/test_verification.py, 18 tests;
+  tests/test_verification_outcomes.py, 11 tests). The model's `complete` is stored as a claim
+  and is never evidence (`test_completion_claim_alone_is_not_evidence`).
+- Modify implementation stays partial: patches and repairs are verified end to end, but only
+  with scripted model output (no live model exists).
 
 Evidence (M4, 2026-09-26):
 - The task now flows through the run: `Orchestrator.run(repo, task)` goes INTAKE → DISCOVER
@@ -79,9 +88,20 @@ Evidence (M2):
 - [x] Explicit execution lifecycle exists
 - [x] Plan
 - [x] Execute
-- [ ] Verify
-- [ ] Repair
-- [~] Finish/terminate
+- [x] Verify
+- [x] Repair
+- [x] Finish/terminate
+
+Evidence (M5, 2026-09-26):
+- Lifecycle extended with BASELINING, VERIFYING, NEEDS_REPAIR, REPAIRING, VERIFIED, UNVERIFIED.
+  VERIFIED is reachable only from VERIFYING, and repair cannot bypass verification
+  (`test_verified_only_through_verifying`, `test_repair_cannot_bypass_verification`).
+- Verify: VERIFYING rounds with typed `VerificationReport`s. Repair: NEEDS_REPAIR → REPAIRING
+  (same Executor/ToolRegistry) → READY_FOR_VERIFICATION → VERIFYING
+  (`test_failed_verification_is_repaired_and_reverified`, `test_regression_is_repaired_then_verified`).
+- Finish/terminate: runs end VERIFIED / UNVERIFIED / BLOCKED / BUDGET_EXHAUSTED / errors, each with
+  a structured reason. The M5 trace covers first-pass, repair, pre-existing failure, regression,
+  environment error, no command, repair limits 0/1/2, and model/tool budget exhaustion.
 
 Evidence (M4, 2026-09-26):
 - Lifecycle: `Phase` enum with an enforced transition table; invalid moves raise
@@ -164,11 +184,26 @@ autonomously yet (the agent loop is M3):
 
 ## R6 — Failure recovery
 
-- [~] Failed test detected
-- [ ] Failure classified
-- [ ] Repair/replan path exists
-- [ ] Retry limit exists
-- [~] Infinite loops prevented
+- [x] Failed test detected
+- [x] Failure classified
+- [x] Repair/replan path exists
+- [x] Retry limit exists
+- [x] Infinite loops prevented
+
+Evidence (M5, 2026-09-26):
+- Detected and classified deterministically: `CommandStatus` (PASS, TEST/BUILD/LINT/TYPECHECK
+  failure, ENVIRONMENT_ERROR, TIMEOUT, TOOL_ERROR, NOT_RUN), baseline-vs-post `Comparison`, and
+  `FailureClass` (TASK_TEST_FAILURE, REGRESSION, BUILD/LINT/TYPECHECK_FAILURE, COMMAND_TIMEOUT,
+  ENVIRONMENT_ERROR, NO_VERIFICATION_EVIDENCE, DIFF_PROBLEM) (tests/test_verification_outcomes.py).
+  Environment errors never trigger repair (`test_environment_error_blocks_without_repair`: BLOCKED,
+  3 model calls, 0 repairs).
+- Repair path: RecoveryController → bounded RepairContext (failure output, fresh file contents,
+  diff, prior attempts) → the same Executor. Replanning is not implemented; the repair path is.
+- Retry limit: `max_repair_cycles` enforced exactly, checked before any model call. With 0, 1
+  and 2 cycles the run makes 3, 5 and 7 model calls and has 1, 2 and 3 verification rounds
+  (`LimitTest`, M5 trace).
+- Loops: the verify/repair loop is bounded by `max_repair_cycles` and by the global step, model
+  and tool budgets, which are never reset.
 
 Evidence (M4, 2026-09-26) — bounded termination only, no recovery:
 - Failed test detected: partial. A failing test command is recorded as a structured observation
@@ -182,15 +217,29 @@ Evidence (M4, 2026-09-26) — bounded termination only, no recovery:
 
 ## R7 — Verification
 
-- [ ] Tests are executed
-- [ ] Git diff inspected
-- [ ] Acceptance criteria checked
-- [ ] Success based on evidence
-- [ ] Failed verification triggers repair
+- [x] Tests are executed
+- [x] Git diff inspected
+- [x] Acceptance criteria checked
+- [x] Success based on evidence
+- [x] Failed verification triggers repair
 
-Evidence:
-- None yet. M4 deliberately stops at `READY_FOR_VERIFICATION`. The executor *can* run tests
-  and git inspection as tools, but no verification engine decides anything from them (M5).
+Evidence (M5, 2026-09-26):
+- Tests executed: only discovered commands, before editing (baseline) and after each execution
+  or repair. `BASELINE_NOT_AVAILABLE` is recorded when none exists
+  (`test_baseline_runs_before_the_first_edit`, `test_no_verification_command_is_unverified`).
+- Git diff inspected: git_status / git_diff_stat / git_diff snapshots at start, after baseline and at
+  every round. Dirty repositories are preserved and pre-existing changes are not attributed
+  (`test_dirty_repository_is_preserved_and_not_attributed`).
+- Acceptance criteria checked: each criterion is PASS / FAIL / UNKNOWN with evidence ids. PASS only
+  from observed evidence (a related test failed before and passes after, or a structural file
+  check); otherwise UNKNOWN. Conservative by design: many criteria will stay UNKNOWN.
+- Success based on evidence: VERIFIED only with positive evidence (strong: fail→pass,
+  fewer failures, more tests passing; weak and flagged: plan-selected tests pass before and
+  after while files changed). No command → UNVERIFIED; environment → BLOCKED; no tool budget
+  left for verification → BUDGET_EXHAUSTED, never VERIFIED. The EvidenceLedger holds typed items
+  that refer only to observed events (`test_evidence_refers_to_observed_events`).
+- Failed verification triggers repair: NEEDS_REPAIR → REPAIRING → re-verification
+  (`RepairTest`, `RegressionTest`).
 
 ---
 
@@ -201,6 +250,15 @@ Evidence:
 - [x] Context usage controlled
 - [ ] Targeted tests before full suite
 - [~] Expensive operations avoided when unnecessary
+
+Evidence (M5, 2026-09-26):
+- Verification needs no model call. It still runs when the model budget is exhausted, and only
+  the repair is refused (`test_no_model_budget_left_for_repair_but_verification_still_runs`).
+- Verification and repair use the same global counters (e.g. a repaired run: 7 model calls,
+  19 tool calls = 6 baseline + 2 execute + 4 verify + 1 fresh read + 2 repair + 4 verify, asserted
+  exactly). `max_verification_commands` caps commands per round; the rest are recorded NOT_RUN
+  (`test_verification_command_cap`). No repair is attempted for environment errors.
+- Targeted tests before full suite: still missing. Discovery only finds suite-level commands.
 
 Evidence (M4, 2026-09-26):
 - Budgets enforced before the operation that would exceed them, exact counts asserted:
@@ -268,6 +326,10 @@ Evidence (M1, 2026-09-26):
 - [x] reads AI_API_KEY
 - [x] no hardcoded credentials
 - [x] .env.example contains no real credential
+
+Evidence (M5, 2026-09-26, additional):
+- With a fake key in the environment, the M5 trace across 11 scenarios found it in no RunState,
+  report, model request or evidence item.
 
 Evidence (M4, 2026-09-26, additional):
 - ScriptedModel runs need no key (`AI_API_KEY` removed in `OrchestratorCase`). With a fake key set
@@ -341,6 +403,8 @@ Evidence (M1, 2026-09-26):
   skipped without ripgrep). Still no runtime dependencies.
 - M4 (2026-09-26): same runs with 303 tests: all pass on Python 3.10.19, offline 3.12, and
   without ripgrep (2 skipped).
+- M5 (2026-09-26): same runs with 338 tests: all pass (2 ripgrep-only tests skipped without
+  ripgrep). Still no runtime dependencies.
 
 ---
 

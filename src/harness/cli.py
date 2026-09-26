@@ -20,7 +20,7 @@ from harness import __version__
 from harness.config import API_KEY_VAR, Config, ConfigError, load_config, load_context_limits
 
 EXIT_OK = 0
-EXIT_RUN_INCOMPLETE = 1     # the run ended without reaching READY_FOR_VERIFICATION
+EXIT_NOT_VERIFIED = 1       # the run ended in any terminal phase other than VERIFIED
 EXIT_USAGE = 2              # usage, configuration (including an unsupported provider) or input error
 EXIT_INTERRUPTED = 130
 
@@ -137,7 +137,7 @@ def _execute(config: Config, task_input: TaskInput, stdout: TextIO, stderr: Text
         return EXIT_INTERRUPTED
     stdout.write(config.redact(format_run(state)))
     stdout.flush()
-    return EXIT_OK if state.phase == Phase.READY_FOR_VERIFICATION else EXIT_RUN_INCOMPLETE
+    return EXIT_OK if state.phase == Phase.VERIFIED else EXIT_NOT_VERIFIED
 
 
 def _inspect(args: argparse.Namespace, *, environ: Optional[Mapping[str, str]], dotenv_path: Optional[Path],

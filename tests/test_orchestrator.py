@@ -1,4 +1,12 @@
-"""End-to-end M4 runs with ScriptedModel: task -> discovery -> plan -> actions -> READY_FOR_VERIFICATION."""
+"""End-to-end runs with ScriptedModel: task -> discovery -> plan -> baseline -> actions -> verification.
+
+M4 tests of the execution mechanics. Since M5 every completed execution is verified, so:
+- tool-call totals include the fixed baseline/verification overhead of the buggy fixture
+  (``BASELINE_TOOLS``, ``VERIFY_TOOLS``);
+- scripts that complete without the fix use ``NO_REPAIR`` (max_repair_cycles=0) so the run stops
+  right after verification instead of asking the scripted model for a repair.
+M5-specific behaviour is tested in tests/test_verification*.py.
+"""
 
 import json
 import os
@@ -23,6 +31,10 @@ from tests.repo_fixtures import snapshot
 
 PY = sys.executable
 TEST_COMMAND = [PY, "-m", "unittest", "discover", "-s", "tests", "-t", "."]
+# buggy fixture (git, one discovered test command):
+BASELINE_TOOLS = 6   # initial git_status + git_diff_stat + git_diff, run_tests, after-baseline git_status + git_diff_stat
+VERIFY_TOOLS = 4     # run_tests, git_status + git_diff_stat + git_diff
+NO_REPAIR = Limits(max_repair_cycles=0)
 
 
 @unittest.skipUnless(shutil.which("git"), "git not installed")
@@ -50,14 +62,16 @@ class ReadPatchIntegrationTest(OrchestratorCase):
             tool("apply_patch", patch=FIX_PATCH),
             complete("add_one returns x + 1"),
         )
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)
-        self.assertNotEqual(state.phase, Phase.VERIFIED)
-        self.assertEqual(state.terminal_reason, "add_one returns x + 1")
+        # The executor stops at READY_FOR_VERIFICATION; the verifier (not the model) decides.
         self.assertEqual([t.target for t in state.transitions],
-                         [Phase.DISCOVER, Phase.PLAN, Phase.EXECUTE, Phase.READY_FOR_VERIFICATION])
+                         [Phase.DISCOVER, Phase.PLAN, Phase.BASELINING, Phase.EXECUTE,
+                          Phase.READY_FOR_VERIFICATION, Phase.VERIFYING, Phase.VERIFIED])
+        self.assertEqual(state.completion_claims, [(3, "add_one returns x + 1")])
+        self.assertNotIn("add_one returns x + 1", state.terminal_reason)   # the claim is not the verdict
         self.assertEqual(state.modified_files, ["src/math_utils.py"])
         self.assertIn("return x + 1", (self.root / "src" / "math_utils.py").read_text())
-        self.assertEqual((state.steps, state.model_calls, state.tool_calls), (3, 4, 2))
+        self.assertEqual((state.steps, state.model_calls, state.tool_calls),
+                         (3, 4, BASELINE_TOOLS + 2 + VERIFY_TOOLS))
         self.assertEqual([(a.kind, a.tool) for a in state.action_history],
                          [("tool", "read_file"), ("tool", "apply_patch"), ("complete", None)])
         read, patch = state.observations
@@ -82,15 +96,18 @@ class ReadPatchIntegrationTest(OrchestratorCase):
         self.assertNotIn("### src/math_utils.py:", after.split("# Plan")[0])
 
     def test_one_action_per_model_call(self):
-        state = self.run_script(plan_response(), *[tool("read_file", path="src/math_utils.py")] * 3, complete())
+        state = self.run_script(plan_response(), *[tool("read_file", path="src/math_utils.py")] * 3, complete(),
+                                limits=NO_REPAIR)
         self.assertEqual(state.steps, 4)
         self.assertEqual(state.model_calls, 1 + state.steps)
-        self.assertEqual(state.tool_calls, 3)
+        self.assertEqual(len(state.observations), 3)
+        self.assertEqual(state.metrics.tool_calls_by_name["read_file"], 3)
 
 
 class CommandObservationTest(OrchestratorCase):
     def test_failing_tests_are_a_successful_tool_call_with_a_failed_command(self):
-        state = self.run_script(plan_response(), tool("run_tests", command=TEST_COMMAND), complete("not fixed yet"))
+        state = self.run_script(plan_response(), tool("run_tests", command=TEST_COMMAND), complete("not fixed yet"),
+                                limits=NO_REPAIR)
         (obs,) = state.observations
         self.assertTrue(obs.success)                   # tool invocation succeeded
         self.assertEqual(obs.outcome, "command_failed")  # test command failed
@@ -98,8 +115,9 @@ class CommandObservationTest(OrchestratorCase):
         self.assertFalse(obs.timed_out)
         self.assertIsNone(obs.error_code)
         self.assertIn("AssertionError: 3 != 2", obs.result_summary)
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)   # not TOOL_ERROR, no repair attempted
-        self.assertEqual(state.metrics.command_calls, 1)
+        self.assertNotEqual(state.phase, Phase.TOOL_ERROR)           # a failing command is not a tool failure
+        self.assertEqual(state.repair_cycles, 0)
+        self.assertEqual(state.metrics.command_calls, 3)             # baseline + executor + verification
         self.assertIn("tool ok, command_failed, exit_code=1", self.model.requests[2].messages[1].content)
 
     def test_command_timeout_comes_from_configuration(self):
@@ -119,7 +137,7 @@ class BudgetTest(OrchestratorCase):
                                 limits=Limits(max_steps=3))
         self.assertEqual(state.phase, Phase.BUDGET_EXHAUSTED)
         self.assertEqual(state.failure.details, {"budget": "steps", "used": 3, "limit": 3})
-        self.assertEqual((state.steps, state.model_calls, state.tool_calls), (3, 4, 3))
+        self.assertEqual((state.steps, state.model_calls, state.tool_calls), (3, 4, BASELINE_TOOLS + 3))
         self.assertEqual(self.model.remaining, 2)          # no extra model call to announce it
 
     def test_model_call_budget(self):
@@ -127,22 +145,33 @@ class BudgetTest(OrchestratorCase):
                                 limits=Limits(max_model_calls=3))
         self.assertEqual(state.phase, Phase.BUDGET_EXHAUSTED)
         self.assertEqual(state.failure.details, {"budget": "model_calls", "used": 3, "limit": 3})
-        self.assertEqual((state.model_calls, state.steps, state.tool_calls), (3, 2, 2))
+        self.assertEqual((state.model_calls, state.steps, state.tool_calls), (3, 2, BASELINE_TOOLS + 2))
         self.assertEqual(self.model.call_count, 3)
 
     def test_tool_call_budget_checked_before_dispatch(self):
+        limit = BASELINE_TOOLS + 2
         state = self.run_script(plan_response(), *[tool("read_file", path="src/math_utils.py")] * 5,
-                                limits=Limits(max_tool_calls=2))
+                                limits=Limits(max_tool_calls=limit))
         self.assertEqual(state.phase, Phase.BUDGET_EXHAUSTED)
-        self.assertEqual(state.failure.details, {"budget": "tool_calls", "used": 2, "limit": 2})
-        self.assertEqual((state.tool_calls, state.model_calls, state.steps), (2, 4, 3))
+        self.assertEqual(state.failure.details, {"budget": "tool_calls", "used": limit, "limit": limit})
+        self.assertEqual((state.tool_calls, state.model_calls, state.steps), (limit, 4, 3))
         self.assertEqual(len(state.observations), 2)
 
-    def test_completing_exactly_at_the_tool_budget_is_fine(self):
+    def test_exact_tool_budget_for_execution_and_verification(self):
+        limit = BASELINE_TOOLS + 2 + VERIFY_TOOLS
         state = self.run_script(plan_response(), tool("read_file", path="src/math_utils.py"),
-                                tool("apply_patch", patch=FIX_PATCH), complete(), limits=Limits(max_tool_calls=2))
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)
-        self.assertEqual(state.tool_calls, 2)
+                                tool("apply_patch", patch=FIX_PATCH), complete(), limits=Limits(max_tool_calls=limit))
+        self.assertEqual(state.phase, Phase.VERIFIED)
+        self.assertEqual(state.tool_calls, limit)
+
+    def test_no_tool_budget_left_for_verification_is_never_verified(self):
+        limit = BASELINE_TOOLS + 2
+        state = self.run_script(plan_response(), tool("read_file", path="src/math_utils.py"),
+                                tool("apply_patch", patch=FIX_PATCH), complete(), limits=Limits(max_tool_calls=limit))
+        self.assertEqual(state.phase, Phase.BUDGET_EXHAUSTED)
+        self.assertEqual(state.failure.details, {"budget": "tool_calls", "used": limit, "limit": limit,
+                                                 "phase": "verification"})
+        self.assertEqual(state.verification_reports, [])
 
     def test_planner_alone_can_use_the_whole_model_budget(self):
         state = self.run_script(plan_response(), complete(), limits=Limits(max_model_calls=1))
@@ -157,9 +186,9 @@ class BudgetTest(OrchestratorCase):
 
     def test_execution_requests_stay_bounded(self):
         state = self.run_script(plan_response(), *[tool("read_file", path="src/math_utils.py")] * 30, complete(),
-                                limits=Limits(max_steps=40))
+                                limits=Limits(max_steps=40, max_repair_cycles=0))
         sizes = [len(r.messages[1].content) for r in self.model.requests[1:]]
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)
+        self.assertEqual(state.steps, 31)
         self.assertLess(max(sizes[22:]) - min(sizes[22:]), 200)   # windows saturated: no growth
 
 
@@ -185,7 +214,8 @@ class MalformedOutputTest(OrchestratorCase):
     def test_malformed_action_json(self):
         state = self.run_script(plan_response(), text_response('{"action": "tool", "tool": "read_file",'))
         self.assert_terminal(state, Phase.MODEL_ERROR, "invalid_action")
-        self.assertEqual(state.tool_calls, 0)
+        self.assertEqual(state.observations, [])                # nothing dispatched for the bad action
+        self.assertEqual(state.tool_calls, BASELINE_TOOLS)
 
     def test_unknown_action(self):
         state = self.run_script(plan_response(), text_response('{"action": "shell", "command": "rm -rf /"}'))
@@ -193,17 +223,18 @@ class MalformedOutputTest(OrchestratorCase):
         self.assertIn("unknown action 'shell'", state.failure.message)
 
     def test_native_malformed_arguments_are_a_structured_tool_error(self):
-        state = self.run_script(plan_response(), malformed_tool_call_response("read_file", '{"path": '), complete())
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)
+        state = self.run_script(plan_response(), malformed_tool_call_response("read_file", '{"path": '), complete(),
+                                limits=NO_REPAIR)
+        self.assertNotIn(state.phase, (Phase.MODEL_ERROR, Phase.TOOL_ERROR))
         (obs,) = state.observations
         self.assertEqual((obs.success, obs.outcome, obs.error_code), (False, "tool_error", "invalid_arguments"))
         self.assertEqual(state.action_history[0].source, "native")
 
     def test_unknown_tool_is_a_structured_tool_error(self):
-        state = self.run_script(plan_response(), tool("delete_everything"), complete())
+        state = self.run_script(plan_response(), tool("delete_everything"), complete(), limits=NO_REPAIR)
         (obs,) = state.observations
         self.assertEqual((obs.success, obs.error_code), (False, "unknown_tool"))
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)
+        self.assertNotIn(state.phase, (Phase.MODEL_ERROR, Phase.TOOL_ERROR))
 
     def test_model_errors_end_cleanly(self):
         state = self.run_script(plan_response(), ModelError("HTTP 503", retryable=True))
@@ -270,10 +301,10 @@ class WiringTest(OrchestratorCase):
             checks.append(snapshot(self.root) == before)
             return complete()
 
-        state = self.run_script(planner, first_action)
-        self.assertEqual(checks, [True, True])
+        state = self.run_script(planner, first_action, limits=NO_REPAIR)
+        self.assertEqual(checks, [True, True])   # discovery, planning and the baseline test run changed nothing
         self.assertEqual(snapshot(self.root), before)
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)
+        self.assertEqual(state.metrics.command_calls, 2)   # baseline + verification ran the tests
 
     def test_planner_sees_resolved_interpreter_not_bare_python(self):
         state = self.run_script(plan_response(), complete())
@@ -284,8 +315,7 @@ class WiringTest(OrchestratorCase):
 
     def test_unresolved_spelling_from_summary_maps_to_resolved_command(self):
         state = self.run_script(plan_response(verification_candidates=["python -m unittest discover -s tests -t ."]),
-                                complete())
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)
+                                complete(), limits=NO_REPAIR)
         self.assertEqual(state.plan.verification_candidates[0].argv[0], PY)
 
     def test_invented_verification_command_is_rejected(self):
@@ -294,7 +324,7 @@ class WiringTest(OrchestratorCase):
 
     def test_chosen_verification_command_is_carried_in_the_plan(self):
         command = f"{PY} -m unittest discover -s tests -t ."
-        state = self.run_script(plan_response(verification_candidates=[command]), complete())
+        state = self.run_script(plan_response(verification_candidates=[command]), complete(), limits=NO_REPAIR)
         self.assertEqual([" ".join(c.argv) for c in state.plan.verification_candidates], [command])
 
     def test_invalid_input(self):

@@ -31,6 +31,13 @@ from harness.tools.paths import relative_posix, resolve_in_repo
 # Removed from every child process environment.
 SCRUBBED_ENV_VARS = frozenset({API_KEY_VAR})
 
+# Set for run_command / run_tests. Python must not write bytecode caches: a .pyc
+# written by one run (e.g. the baseline) can be reused for a same-size source edit
+# made within the same second (pyc validation uses whole-second mtime + size), so a
+# later test run would execute stale code. It also keeps __pycache__ out of the
+# target repository.
+COMMAND_ENV = {"PYTHONDONTWRITEBYTECODE": "1"}
+
 SHELL_OPERATOR_CHARS = "();<>|&\n"
 
 # Programs that administer or destroy the machine. Matched by basename.
@@ -370,7 +377,7 @@ def _run(ctx: ToolContext, command: Command, cwd: Optional[str], timeout_seconds
     timeout = min(timeout_seconds or limit, limit)
     ctx.metrics.record_command()
     return execute(argv, root=ctx.root, cwd=workdir, timeout=timeout,
-                   max_output_bytes=ctx.limits.max_output_bytes)
+                   max_output_bytes=ctx.limits.max_output_bytes, extra_env=COMMAND_ENV)
 
 
 def run_command(ctx: ToolContext, command: Command, cwd: Optional[str] = None,

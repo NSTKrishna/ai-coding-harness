@@ -8,7 +8,9 @@ action. Budgets are checked before the operation that would exceed them:
 
 Exhausting a budget ends the run in ``BUDGET_EXHAUSTED`` without another model
 call. ``complete`` ends it in ``READY_FOR_VERIFICATION``, never in a verified
-state. Each request is rebuilt from bounded state (no growing conversation).
+state; the summary is kept as a completion *claim*, not evidence. The same loop
+runs the initial execution (EXECUTE) and every repair (REPAIRING); only the
+request context differs. Each request is rebuilt from bounded state.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from harness.context.manager import ContextManager
 from harness.model.types import Message, ModelError, ModelRequest
 from harness.orchestrator.observe import observe, summarize_arguments
 from harness.orchestrator.protocol import ProtocolError, parse_action
-from harness.orchestrator.state import ActionRecord, Failure, Phase, RunState
+from harness.orchestrator.state import EXECUTING, ActionRecord, Failure, Phase, RunState
 from harness.tools.registry import ToolRegistry
 
 EXECUTOR_MAX_OUTPUT_TOKENS = 4_000
@@ -57,9 +59,9 @@ class Executor:
         self.redact = redact or (lambda text: text)
 
     def execute(self, state: RunState) -> None:
-        """Run until a terminal phase. ``state.phase`` must be EXECUTE."""
+        """Run while ``state.phase`` is EXECUTE or REPAIRING."""
         metrics = state.metrics
-        while not state.is_terminal:
+        while state.phase in EXECUTING:
             if state.steps >= self.limits.max_steps:
                 self._exhausted(state, "steps", state.steps, self.limits.max_steps)
                 return
@@ -89,7 +91,8 @@ class Executor:
 
             if action.kind == "complete":
                 state.action_history.append(ActionRecord(step, "complete"))
-                state.transition(Phase.READY_FOR_VERIFICATION, self.redact(action.text))
+                state.completion_claims.append((step, self.redact(action.text)))
+                state.transition(Phase.READY_FOR_VERIFICATION, "executor reported completion (a claim, not evidence)")
                 return
             if action.kind == "blocked":
                 state.action_history.append(ActionRecord(step, "blocked"))
@@ -111,6 +114,9 @@ class Executor:
             state.add_observation(observation)
             if call.name == "apply_patch" and result.success:
                 self._after_patch(state, step, observation.affected_paths)
+                if state.changes is not None:
+                    label = "execute" if state.phase == Phase.EXECUTE else f"repair-{state.repair_cycles}"
+                    state.changes.record_patch(result.data.files, label)
 
     # ------------------------------------------------------------------------
     def _after_patch(self, state: RunState, step: int, paths) -> None:
@@ -151,6 +157,7 @@ class Executor:
         sections = [
             self.context.render().rstrip("\n"),   # task (capped), repository summary, current evidence
             "# Plan\n" + (state.plan.render() if state.plan is not None else "none"),
+            "# Verification\n" + (state.verification_brief() or "no baseline information"),
             f"# Files modified so far\n{modified}",
             "# Action history\n" + ("\n".join(history_lines) or "none yet"),
             "# Recent observations\n" + ("\n".join(obs_lines) or "none yet"),

@@ -78,6 +78,16 @@ class LoadConfigTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_config({"AI_API_KEY": FAKE_KEY, "HARNESS_MAX_TOOL_CALLS": "0"}, NO_DOTENV)
 
+    def test_repair_cycles_may_be_zero_and_verification_cap(self):
+        config = load_config({"AI_API_KEY": FAKE_KEY, "HARNESS_MAX_REPAIR_CYCLES": "0",
+                              "HARNESS_MAX_VERIFICATION_COMMANDS": "2"}, NO_DOTENV)
+        self.assertEqual((config.limits.max_repair_cycles, config.limits.max_verification_commands), (0, 2))
+        for name in ("HARNESS_MAX_REPAIR_CYCLES", "HARNESS_MAX_VERIFICATION_COMMANDS"):
+            with self.subTest(name=name), self.assertRaises(ConfigError):
+                load_config({"AI_API_KEY": FAKE_KEY, name: "-1"}, NO_DOTENV)
+        with self.assertRaises(ConfigError):
+            load_config({"AI_API_KEY": FAKE_KEY, "HARNESS_MAX_VERIFICATION_COMMANDS": "0"}, NO_DOTENV)
+
     def test_invalid_limits_name_the_variable(self):
         for value in ("abc", "0", "-3", "1.5"):
             with self.subTest(value=value):

@@ -3,11 +3,12 @@
 An autonomous software-engineering harness around a text-only foundation model.
 Architecture: [arch.md](arch.md). Status: [PROGRESS.md](PROGRESS.md).
 
-> Current state: milestone M4. The control layer exists (discovery → plan →
-> one-action-per-step execution → `READY_FOR_VERIFICATION`; arch.md §4–§5, §10, §12)
-> and is exercised end to end with a scripted model. No live model adapter exists
-> yet (the provider has not been announced), so `make run` accepts input and then
-> stops with a precise "provider not supported" message. Verification (M5) is not built.
+> Current state: milestone M5. A run goes discovery → plan → baseline (tests run before
+> any edit) → one-action-per-step execution → evidence-based verification → bounded
+> repair → re-verification, ending VERIFIED only on observed evidence (arch.md §4, §14–§16).
+> It is exercised end to end with a scripted model. No live model adapter exists yet (the
+> provider has not been announced), so `make run` accepts input and then stops with a
+> precise "provider not supported" message.
 
 ## Requirements
 
@@ -64,10 +65,11 @@ Set in the environment, or in a `.env` file in the directory you run from
 | `AI_MODEL` | no | unset until organizers announce it |
 | `AI_BASE_URL` | no | unset until organizers announce it |
 | `HARNESS_MAX_STEPS` | no | 40 |
-| `HARNESS_MAX_REPAIR_CYCLES` | no | 3 |
+| `HARNESS_MAX_REPAIR_CYCLES` | no | 3 (0 = verify, never repair) |
 | `HARNESS_COMMAND_TIMEOUT_SECONDS` | no | 300 |
 | `HARNESS_MAX_MODEL_CALLS` | no | 60 |
 | `HARNESS_MAX_TOOL_CALLS` | no | 80 |
+| `HARNESS_MAX_VERIFICATION_COMMANDS` | no | 3 |
 | `HARNESS_MAX_ACTIVE_FILES` | no | 8 |
 | `HARNESS_MAX_CANDIDATES` | no | 25 |
 | `HARNESS_MAX_EVIDENCE_ITEMS` | no | 24 |

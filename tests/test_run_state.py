@@ -16,14 +16,23 @@ def obs(step, paths=("a.py",)):
 
 class PhaseTransitionTest(unittest.TestCase):
     def test_happy_path(self):
+        path = (Phase.DISCOVER, Phase.PLAN, Phase.BASELINING, Phase.EXECUTE, Phase.READY_FOR_VERIFICATION,
+                Phase.VERIFYING, Phase.VERIFIED)
         state = RunState(task="t", repo_root="/r")
-        for phase in (Phase.DISCOVER, Phase.PLAN, Phase.EXECUTE, Phase.READY_FOR_VERIFICATION):
+        for phase in path:
+            self.assertFalse(state.is_terminal)
             state.transition(phase, f"to {phase.value}")
-        self.assertEqual(state.phase, Phase.READY_FOR_VERIFICATION)
         self.assertTrue(state.is_terminal)
-        self.assertEqual(state.terminal_reason, "to READY_FOR_VERIFICATION")
-        self.assertEqual([t.target for t in state.transitions],
-                         [Phase.DISCOVER, Phase.PLAN, Phase.EXECUTE, Phase.READY_FOR_VERIFICATION])
+        self.assertEqual(state.terminal_reason, "to VERIFIED")
+        self.assertEqual([t.target for t in state.transitions], list(path))
+
+    def test_repair_loop_path(self):
+        state = RunState(task="t", repo_root="/r")
+        for phase in (Phase.DISCOVER, Phase.PLAN, Phase.BASELINING, Phase.EXECUTE, Phase.READY_FOR_VERIFICATION,
+                      Phase.VERIFYING, Phase.NEEDS_REPAIR, Phase.REPAIRING, Phase.READY_FOR_VERIFICATION,
+                      Phase.VERIFYING, Phase.UNVERIFIED):
+            state.transition(phase)
+        self.assertEqual(state.phase, Phase.UNVERIFIED)
 
     def test_invalid_transitions_rejected(self):
         state = RunState(task="t", repo_root="/r")
@@ -33,13 +42,25 @@ class PhaseTransitionTest(unittest.TestCase):
             state.transition(Phase.EXECUTE)
         self.assertEqual(state.phase, Phase.INTAKE)
 
-    def test_verified_and_repair_are_unreachable_in_m4(self):
-        for start in (Phase.INTAKE, Phase.DISCOVER, Phase.PLAN, Phase.EXECUTE, Phase.READY_FOR_VERIFICATION):
-            for target in (Phase.VERIFYING, Phase.VERIFIED, Phase.NEEDS_REPAIR):
-                state = RunState(task="t", repo_root="/r")
-                state.phase = start
-                with self.subTest(start=start, target=target), self.assertRaises(InvalidTransition):
-                    state.transition(target)
+    def test_verified_only_through_verifying(self):
+        for start in Phase:
+            if start == Phase.VERIFYING:
+                continue
+            state = RunState(task="t", repo_root="/r")
+            state.phase = start
+            with self.subTest(start=start), self.assertRaises(InvalidTransition):
+                state.transition(Phase.VERIFIED)
+
+    def test_repair_cannot_bypass_verification(self):
+        for start, target in ((Phase.NEEDS_REPAIR, Phase.VERIFIED), (Phase.NEEDS_REPAIR, Phase.EXECUTE),
+                              (Phase.REPAIRING, Phase.VERIFYING), (Phase.REPAIRING, Phase.UNVERIFIED),
+                              (Phase.EXECUTE, Phase.VERIFYING), (Phase.PLAN, Phase.EXECUTE),
+                              (Phase.BASELINING, Phase.READY_FOR_VERIFICATION), (Phase.VERIFYING, Phase.REPAIRING),
+                              (Phase.READY_FOR_VERIFICATION, Phase.REPAIRING)):
+            state = RunState(task="t", repo_root="/r")
+            state.phase = start
+            with self.subTest(start=start, target=target), self.assertRaises(InvalidTransition):
+                state.transition(target)
 
     def test_terminal_phases_have_no_exit(self):
         for terminal in TERMINAL:

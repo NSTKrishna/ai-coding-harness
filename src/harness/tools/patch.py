@@ -25,6 +25,7 @@ are restored.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -81,6 +82,8 @@ class PatchedFile:
     hunks: int
     added: int
     removed: int
+    before_sha256: Optional[str] = None   # content hash before this patch (None: file did not exist)
+    after_sha256: Optional[str] = None    # content hash after this patch (None: file deleted)
 
 
 @dataclass(frozen=True)
@@ -307,8 +310,12 @@ def apply_patch(ctx: ToolContext, patch: str) -> PatchResult:
             summary[target] = [rel, action, len(fp.hunks), added, removed]
 
     _write_all(ctx, planned)
-    files = tuple(PatchedFile(*summary[t]) for t in planned)
+    files = tuple(PatchedFile(*summary[t], _sha256(planned[t][0]), _sha256(planned[t][1])) for t in planned)
     return PatchResult(files=files, warnings=tuple(warnings))
+
+
+def _sha256(text: Optional[str]) -> Optional[str]:
+    return None if text is None else hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _read_current(ctx: ToolContext, target: Path) -> Optional[str]:

@@ -1,4 +1,9 @@
-"""Orchestrator: INTAKE -> DISCOVER -> PLAN -> EXECUTE -> READY_FOR_VERIFICATION.
+"""Orchestrator: INTAKE -> DISCOVER -> PLAN -> BASELINING -> EXECUTE ->
+READY_FOR_VERIFICATION -> VERIFYING -> VERIFIED | UNVERIFIED | BLOCKED |
+NEEDS_REPAIR -> REPAIRING -> READY_FOR_VERIFICATION -> VERIFYING ...
+
+The repair loop is bounded by ``max_repair_cycles`` and every repair is followed
+by verification; nothing reaches VERIFIED except through the VerificationEngine.
 
 It coordinates and owns no subsystem logic: discovery is M3's
 ``discover_for_task``, tools are M2's registry, planning and execution are the
@@ -25,6 +30,10 @@ from harness.orchestrator.state import Failure, Phase, RunState
 from harness.repo.discovery import discover_for_task
 from harness.tools import build_registry
 from harness.tools.base import ToolContext, ToolLimits
+from harness.verify.commands import select_verification_commands
+from harness.verify.engine import Verdict, VerificationBudgetExhausted, VerificationEngine
+from harness.verify.ledger import ChangeLedger, EvidenceLedger
+from harness.verify.recovery import RecoveryController, RepairLimit
 
 
 def tool_limits_from(limits: Limits, base: Optional[ToolLimits] = None) -> ToolLimits:
@@ -98,8 +107,55 @@ class Orchestrator:
                              Failure("model_call_failed", message, {"retryable": exc.retryable}))
             return
 
+        # BASELINING (deterministic, before any edit) -----------------------------
+        state.transition(Phase.BASELINING, "plan accepted")
+        state.evidence, state.changes = EvidenceLedger(), ChangeLedger()
+        state.verification_commands = select_verification_commands(
+            state.plan, discovery.repo_profile, ctx.root, self.limits.max_verification_commands)
+        engine = VerificationEngine(registry, state, self.limits, state.evidence, state.changes)
+        try:
+            state.baseline = engine.baseline()
+        except VerificationBudgetExhausted as exc:
+            self._budget(state, "tool_calls", exc.used, exc.limit, "baseline")
+            return
+
         # EXECUTE ----------------------------------------------------------------
-        state.transition(Phase.EXECUTE, f"plan with {len(state.plan.steps)} step(s)")
+        state.transition(Phase.EXECUTE, f"baseline: {len(state.baseline.runs)} command(s) run")
         context = ContextManager(cap_task(task), discovery.repo_profile.summary(), self.context_limits)
         context.load_working_set(discovery.working_set)
-        Executor(model, registry, context, self.limits, self.executor_settings, redact=self.redact).execute(state)
+        executor = Executor(model, registry, context, self.limits, self.executor_settings, redact=self.redact)
+        recovery = RecoveryController(registry, state, self.limits, context)
+        executor.execute(state)
+
+        # VERIFY / REPAIR loop (bounded by max_repair_cycles) ------------------------
+        while state.phase == Phase.READY_FOR_VERIFICATION:
+            state.transition(Phase.VERIFYING, f"verification round {len(state.verification_reports) + 1}")
+            try:
+                report = engine.verify(len(state.verification_reports) + 1)
+            except VerificationBudgetExhausted as exc:
+                self._budget(state, "tool_calls", exc.used, exc.limit, "verification")
+                return
+            state.verification_reports.append(report)
+            recovery.record_verification(report)
+            if report.verdict != Verdict.NEEDS_REPAIR:
+                target = {Verdict.VERIFIED: Phase.VERIFIED, Verdict.UNVERIFIED: Phase.UNVERIFIED,
+                          Verdict.BLOCKED: Phase.BLOCKED}[report.verdict]
+                failure = None if target == Phase.VERIFIED else Failure(
+                    report.failure_class.value.lower() if report.failure_class else "unverified", report.summary)
+                state.transition(target, report.summary, failure)
+                return
+            state.transition(Phase.NEEDS_REPAIR, report.summary)
+            try:
+                state.repair_context = recovery.prepare(report)
+            except RepairLimit as exc:
+                self._budget(state, exc.budget, exc.used, exc.limit, "repair")
+                return
+            state.transition(Phase.REPAIRING, f"repair cycle {state.repair_cycles} for {report.failure_class.value}")
+            executor.execute(state)
+            state.repair_context = None if state.phase != Phase.REPAIRING else state.repair_context
+
+    @staticmethod
+    def _budget(state: RunState, budget: str, used: int, limit: int, where: str) -> None:
+        state.transition(Phase.BUDGET_EXHAUSTED, f"{budget} budget exhausted during {where} ({used}/{limit})",
+                         Failure("budget", f"{budget} budget exhausted",
+                                 {"budget": budget, "used": used, "limit": limit, "phase": where}))
