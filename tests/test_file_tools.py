@@ -148,6 +148,40 @@ class FileToolsTest(RepoTestCase):
         ctx = ToolContext.create(self.repo, limits=ToolLimits(max_file_bytes=10))
         error = build_registry(ctx).dispatch("read_file", {"path": "src/app.py"}).error
         self.assertEqual(error.code, "file_too_large")
+        self.assertIn("read_range", error.message)
+
+    def test_read_range_streams_oversized_file(self):
+        ctx = ToolContext.create(self.repo, limits=ToolLimits(max_file_bytes=10))
+        registry = build_registry(ctx)
+        self.assertEqual(registry.dispatch("read_file", {"path": "src/app.py"}).error.code, "file_too_large")
+        data = registry.dispatch("read_range", {"path": "src/app.py", "start_line": 3, "end_line": 5}).data
+        self.assertEqual(data.content, "line 3\nline 4\nline 5\n")
+        self.assertEqual((data.start_line, data.end_line, data.total_lines), (3, 5, 10))
+        self.assertFalse(data.truncated)
+        clamped = registry.dispatch("read_range", {"path": "src/app.py", "start_line": 9, "end_line": 500}).data
+        self.assertEqual(clamped.content, "line 9\nline 10\n")
+        self.assertEqual(clamped.end_line, 10)
+        error = registry.dispatch("read_range", {"path": "src/app.py", "start_line": 50, "end_line": 60}).error
+        self.assertEqual(error.code, "range_out_of_bounds")
+        self.assertIn("has 10 lines", error.message)
+
+    def test_read_range_oversized_file_keeps_other_checks(self):
+        ctx = ToolContext.create(self.repo, limits=ToolLimits(max_file_bytes=4, max_read_chars=20))
+        registry = build_registry(ctx)
+        data = registry.dispatch("read_range", {"path": "src/app.py", "start_line": 1, "end_line": 10}).data
+        self.assertEqual(data.content, "line 1\nline 2\n")
+        self.assertTrue(data.truncated)
+        self.write("image.bin", b"\x89PNG\x00\x00data\n", mode="wb")
+        self.assertEqual(registry.dispatch("read_range", {"path": "image.bin", "start_line": 1, "end_line": 1}).error.code,
+                         "binary_file")
+        self.write("latin1.txt", b"ok\ncaf\xe9\n", mode="wb")
+        error = registry.dispatch("read_range", {"path": "latin1.txt", "start_line": 2, "end_line": 2}).error
+        self.assertEqual(error.code, "decode_error")
+        self.assertEqual(error.details["byte_offset"], 6)
+        self.assertEqual(registry.dispatch("read_range", {"path": "src", "start_line": 1, "end_line": 1}).error.code,
+                         "is_directory")
+        self.assertEqual(registry.dispatch("read_range", {"path": "../outside/secret.txt", "start_line": 1,
+                                                          "end_line": 1}).error.code, "path_outside_repo")
 
 
 if __name__ == "__main__":
