@@ -84,11 +84,8 @@ def find_files(ctx: ToolContext, pattern: str, path: str = ".",
     return FileList(tuple(entries), truncated=False)
 
 
-def load_text_lines(ctx: ToolContext, path: str) -> tuple[Path, list[str], int]:
-    """Read a UTF-8 text file inside the repository. Returns (path, lines, size).
-
-    Lines keep their line endings. Shared by the read tools and the patcher.
-    """
+def _regular_file(ctx: ToolContext, path: str) -> tuple[Path, int]:
+    """Resolve ``path`` to a regular file inside the repository. Returns (path, size)."""
     resolved = resolve_in_repo(ctx.root, path)
     if not resolved.exists():
         raise ToolFailure("not_found", f"'{path}' does not exist")
@@ -96,33 +93,78 @@ def load_text_lines(ctx: ToolContext, path: str) -> tuple[Path, list[str], int]:
         raise ToolFailure("is_directory", f"'{path}' is a directory; use list_files")
     if not resolved.is_file():
         raise ToolFailure("not_a_file", f"'{path}' is not a regular file")
-    size = resolved.stat().st_size
+    return resolved, resolved.stat().st_size
+
+
+def _binary_check(path: str, head: bytes) -> None:
+    if b"\x00" in head[:BINARY_SNIFF_BYTES]:
+        raise ToolFailure("binary_file", f"'{path}' looks like a binary file")
+
+
+def _decode_error(path: str, offset: int) -> ToolFailure:
+    return ToolFailure("decode_error", f"'{path}' is not valid UTF-8 (byte {offset})", {"byte_offset": offset})
+
+
+def load_text_lines(ctx: ToolContext, path: str) -> tuple[Path, list[str], int]:
+    """Read a UTF-8 text file inside the repository. Returns (path, lines, size).
+
+    Lines keep their line endings. Shared by the read tools and the patcher.
+    Files larger than ``max_file_bytes`` are rejected; ``read_range`` streams those.
+    """
+    resolved, size = _regular_file(ctx, path)
     if size > ctx.limits.max_file_bytes:
         raise ToolFailure(
             "file_too_large",
-            f"'{path}' is {size} bytes; the limit is {ctx.limits.max_file_bytes}",
+            f"'{path}' is {size} bytes; the limit is {ctx.limits.max_file_bytes}. "
+            "Use read_range to read a slice of a large file.",
             {"size_bytes": size},
         )
     data = resolved.read_bytes()
-    if b"\x00" in data[:BINARY_SNIFF_BYTES]:
-        raise ToolFailure("binary_file", f"'{path}' looks like a binary file")
+    _binary_check(path, data)
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ToolFailure(
-            "decode_error", f"'{path}' is not valid UTF-8 (byte {exc.start})", {"byte_offset": exc.start}
-        ) from None
+        raise _decode_error(path, exc.start) from None
     return resolved, text.splitlines(keepends=True), size
 
 
+def _stream_lines(ctx: ToolContext, path: str, resolved: Path,
+                  start: int, end: int) -> tuple[list[str], int]:
+    """Lines ``start..end`` of a file read line by line, plus the total line count.
+
+    Only the requested lines are decoded and kept in memory; the rest of the
+    file is scanned so ``total_lines`` is exact.
+    """
+    window: list[str] = []
+    total = 0
+    offset = 0
+    with resolved.open("rb") as handle:
+        _binary_check(path, handle.read(BINARY_SNIFF_BYTES))
+        handle.seek(0)
+        for raw in handle:
+            total += 1
+            if start <= total <= end:
+                try:
+                    window.append(raw.decode("utf-8"))
+                except UnicodeDecodeError as exc:
+                    raise _decode_error(path, offset + exc.start) from None
+            offset += len(raw)
+    return window, total
+
+
 def _content(ctx: ToolContext, resolved: Path, lines: list[str], size: int,
-             start: int, end: int) -> FileContent:
-    """Lines ``start..end`` (1-based, inclusive), cut at a line boundary to fit the char cap."""
+             start: int, end: int, total_lines: Optional[int] = None) -> FileContent:
+    """Lines ``start..end`` (1-based, inclusive), cut at a line boundary to fit the char cap.
+
+    ``lines`` is the whole file unless ``total_lines`` is given, in which case it
+    is just the ``start..end`` window.
+    """
     budget = ctx.limits.max_read_chars
     taken: list[str] = []
     used = 0
     truncated = False
-    for line in lines[start - 1:end]:
+    window = lines[start - 1:end] if total_lines is None else lines
+    for line in window:
         if used + len(line) > budget:
             if not taken:  # a single line longer than the whole budget
                 taken.append(line[:budget])
@@ -135,7 +177,7 @@ def _content(ctx: ToolContext, resolved: Path, lines: list[str], size: int,
         content="".join(taken),
         start_line=start if taken else 0,
         end_line=start + len(taken) - 1 if taken else 0,
-        total_lines=len(lines),
+        total_lines=len(lines) if total_lines is None else total_lines,
         truncated=truncated,
         size_bytes=size,
     )
@@ -153,14 +195,21 @@ def read_range(ctx: ToolContext, path: str, start_line: int, end_line: int) -> F
         raise ToolFailure("invalid_arguments", "line numbers start at 1")
     if start_line > end_line:
         raise ToolFailure("invalid_arguments", f"start_line ({start_line}) is after end_line ({end_line})")
-    resolved, lines, size = load_text_lines(ctx, path)
-    if start_line > len(lines):
+    resolved, size = _regular_file(ctx, path)
+    streamed = size > ctx.limits.max_file_bytes
+    if streamed:
+        lines, total = _stream_lines(ctx, path, resolved, start_line, end_line)
+    else:
+        resolved, lines, size = load_text_lines(ctx, path)
+        total = len(lines)
+    if start_line > total:
         raise ToolFailure(
             "range_out_of_bounds",
-            f"'{path}' has {len(lines)} lines; start_line {start_line} is past the end",
-            {"total_lines": len(lines)},
+            f"'{path}' has {total} lines; start_line {start_line} is past the end",
+            {"total_lines": total},
         )
-    return _content(ctx, resolved, lines, size, start_line, min(end_line, len(lines)))
+    return _content(ctx, resolved, lines, size, start_line, min(end_line, total),
+                    total_lines=total if streamed else None)
 
 
 _PATH = {"type": "string", "description": "Repository-relative path."}
@@ -216,7 +265,7 @@ TOOLS = (
     Tool(
         name="read_range",
         description="Read lines start_line..end_line (1-based, inclusive) of a UTF-8 text file. "
-                    "end_line past the end of the file is clamped.",
+                    "end_line past the end of the file is clamped. Works on files too large for read_file.",
         parameters={
             "type": "object",
             "properties": {
