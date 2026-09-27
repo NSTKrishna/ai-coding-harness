@@ -1,5 +1,6 @@
 """File-editing tools: ``apply_patch`` (unified diff), ``edit_file`` (exact text
-replacement) and ``write_file`` (whole-file create/overwrite). All three return a
+replacement), ``write_file`` (whole-file create/overwrite) and ``delete_file``
+(remove one file). All four return a
 ``PatchResult`` with before/after content hashes, write atomically and go through
 the repository path boundary, so the rest of the harness treats every edit alike.
 
@@ -409,6 +410,30 @@ def edit_file(ctx: ToolContext, path: str, old_text: str, new_text: str, replace
                                           _sha256(current), _sha256(updated)),), warnings=tuple(warnings))
 
 
+def delete_file(ctx: ToolContext, path: str) -> PatchResult:
+    """Remove one file.
+
+    The content is never parsed, only hashed, so a binary file deletes as cleanly as a
+    text one. apply_patch can also delete, but only by restating every line of the file
+    as a removal, which is impossible without having read it first.
+    """
+    target = resolve_in_repo(ctx.root, path, for_write=True)
+    rel = relative_posix(ctx.root, target)
+    if target.is_dir():
+        raise ToolFailure("not_a_file", f"{rel}: is a directory; delete_file removes a single file")
+    if not target.exists():
+        raise ToolFailure("not_found", f"{rel}: file does not exist")
+    raw = target.read_bytes()
+    try:                                      # hash text exactly as the other editing tools do
+        text = _read_current(ctx, target)
+    except ToolFailure:
+        text = None                           # not decodable as text: hash the bytes instead
+    before = _sha256(text) if text is not None else hashlib.sha256(raw).hexdigest()
+    removed = (text if text is not None else raw.decode("utf-8", "replace")).count("\n")
+    _write_all(ctx, {target: (None, None)})   # (None, None): nothing to restore if unlink fails
+    return PatchResult(files=(PatchedFile(rel, "deleted", 1, 0, removed or (1 if raw else 0), before, None),))
+
+
 def write_file(ctx: ToolContext, path: str, content: str) -> PatchResult:
     target = resolve_in_repo(ctx.root, path, for_write=True)
     rel = relative_posix(ctx.root, target)
@@ -459,6 +484,20 @@ TOOLS = (
             "additionalProperties": False,
         },
         handler=write_file,
+        category="write",
+    ),
+    Tool(
+        name="delete_file",
+        description="Delete a single file from the repository. Use this to remove a file; "
+                    "apply_patch can also delete, but only by restating the file's entire "
+                    "content as removed lines.",
+        parameters={
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Repository-relative file path."}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        handler=delete_file,
         category="write",
     ),
     Tool(

@@ -123,6 +123,7 @@ class RunState:
     completion_claims: list[tuple[int, str]] = field(default_factory=list)   # (step, summary); never evidence
     # verification (M5)
     verification_commands: tuple = ()      # verify.commands.VerificationCommand
+    setup_commands: tuple = ()             # repo.commands.CommandCandidate, kind "setup"
     baseline: Any = None                   # verify.engine.BaselineResult
     verification_reports: list = field(default_factory=list)   # verify.engine.VerificationReport per round
     evidence: Any = None                   # verify.ledger.EvidenceLedger

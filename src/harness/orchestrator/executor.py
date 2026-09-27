@@ -31,13 +31,20 @@ from harness.tools.patch import PatchResult
 from harness.tools.registry import ToolRegistry
 
 EXECUTOR_MAX_OUTPUT_TOKENS = 4_000
-REPEAT_NOTE = "\n[harness] Identical to the result"
+HARNESS_NOTE = "\n[harness] "     # every note the harness appends to an observation starts here
+REPEAT_NOTE = HARNESS_NOTE + "Identical to the result"
 LOW_STEPS_WARNING = 5
+EDIT_NUDGE = "No successful edit yet."
 
 
 def _repeat_key(o: Observation) -> tuple:
-    """Identity of a call and its result, ignoring the harness's own repeat note."""
-    return (o.tool, o.arguments_summary, o.outcome, o.result_summary.split(REPEAT_NOTE, 1)[0])
+    """Identity of a call and its result, ignoring any note the harness appended.
+
+    Notes must not change identity: they are the harness talking to the model, not new
+    information from the repository, and counting them as new would hide the very loop
+    they warn about.
+    """
+    return (o.tool, o.arguments_summary, o.outcome, o.result_summary.split(HARNESS_NOTE, 1)[0])
 
 EXECUTOR_INSTRUCTIONS = """You carry out a planned change in a software repository, one action at a time.
 You never touch the repository yourself: every read, search, edit, command or git inspection is a tool
@@ -51,8 +58,8 @@ If your interface supports native tool calls, you may call the tools natively in
 Use "complete" when you believe the changes are done; verification happens afterwards.
 Do not modify or delete existing tests to make them pass; put any new tests in a new test file.
 Edit files only with the editing tools: edit_file (exact text replacement; preferred for existing files),
-write_file (new files, or a full rewrite) or apply_patch (unified diff). Re-read a file after a failed edit
-before trying again."""
+write_file (new files, or a full rewrite), delete_file (remove a file) or apply_patch (unified diff).
+Re-read a file after a failed edit before trying again."""
 
 
 @dataclass(frozen=True)
@@ -62,12 +69,17 @@ class ExecutorSettings:
     history_window: int = 20             # one-line action history entries shown
     max_identical_actions: int = 4       # same tool call with the same result N times in a row -> no progress
     max_invalid_actions: int = 2         # consecutive invalid replies answered with feedback; one more -> MODEL_ERROR
+    cycle_window: int = 8                # observations examined for a loop that learns nothing new
+    max_steps_without_edit: int = 20     # steps with no successful edit, when the plan has edit steps
+    #   20 = half the default step budget. Exploring a large repository before the first edit is
+    #   normal work; only a run that has spent half its budget without one has actually stalled.
 
 
 class Executor:
     def __init__(self, model, registry: ToolRegistry, context: ContextManager, limits: Limits,
                  settings: Optional[ExecutorSettings] = None, redact: Optional[Callable[[str], str]] = None) -> None:
         self.model = model                 # MeteredModelClient sharing the run's metrics
+        self._write_tools = frozenset(t.name for t in registry.definitions(["write"]))
         self.registry = registry
         self.context = context
         self.limits = limits
@@ -153,8 +165,8 @@ class Executor:
         data = result.data if result.success else None
         if (isinstance(data, CommandResult) and data.ok and state.modified_files
                 and (call.name == "run_tests" or "test" in " ".join(data.command).lower())):
-            observation = replace(observation, result_summary=observation.result_summary + (
-                "\n[harness] This test command passed after your changes. If the task is done, call complete "
+            observation = replace(observation, result_summary=observation.result_summary + HARNESS_NOTE + (
+                "This test command passed after your changes. If the task is done, call complete "
                 "now; the harness verifies independently."))
         state.add_observation(observation)
         repeats = self._identical_tail(state)
@@ -165,7 +177,9 @@ class Executor:
                                      f"times with an identical result",
                                      {"no_progress": True, "tool": call.name, "repeats": repeats, "step": step}))
             return False
-        if result.success and isinstance(result.data, PatchResult):   # apply_patch, edit_file, write_file
+        if not self._check_cycle(state, step) or not self._check_stalled_edits(state, step):
+            return False
+        if result.success and isinstance(result.data, PatchResult):   # any write-category tool
             self._after_patch(state, step, observation.affected_paths)
             if state.changes is not None:
                 label = "execute" if state.phase == Phase.EXECUTE else f"repair-{state.repair_cycles}"
@@ -195,6 +209,83 @@ class Executor:
                 break
             count += 1
         return count
+
+    def _is_edit(self, observation: Observation) -> bool:
+        """A successful call to a write-category tool. ``affected_paths`` is not the test:
+        reads and searches set it too, to name the paths they are about."""
+        return observation.outcome == "ok" and observation.tool in self._write_tools
+
+    def _check_cycle(self, state: RunState, step: int) -> bool:
+        """Stop a loop that alternates between a few calls, which _identical_tail cannot see.
+
+        _identical_tail only counts *consecutive* identical observations, so A,B,A,B runs until
+        the step budget is gone. The signal here is informational, not positional: a full window
+        in which every call merely repeats one already made earlier - same arguments, same result -
+        and which changed no file, has taught the run nothing it did not already know.
+
+        Deliberately strict (one genuinely new observation is enough to continue), so a wide
+        search is never mistaken for a loop. Messier flailing is caught by _check_stalled_edits.
+        """
+        size = self.settings.cycle_window
+        window = state.observations[-size:]
+        if len(window) < size or any(self._is_edit(o) for o in window):
+            return True
+        seen_before = {_repeat_key(o) for o in state.observations[:-size]}
+        if any(_repeat_key(o) not in seen_before for o in window):     # anything new is progress
+            return True
+        names = ", ".join(sorted({o.tool for o in window}))
+        return self._stalled(state, step,
+                             f"the last {size} steps repeated earlier calls and changed nothing",
+                             f"the last {size} steps ({names}) all repeated a call already made earlier in the "
+                             f"run, with the same result",
+                             {"cycle": True, "window": size})
+
+    def _check_stalled_edits(self, state: RunState, step: int) -> bool:
+        """Warn, then stop, when a plan that calls for edits is producing none.
+
+        Reading is legitimate work, so this is deliberately slack and escalates: the
+        nudge comes at half the allowance, the stop only at the end of it.
+        """
+        plan = state.plan
+        if plan is None or not any(s.kind == "edit" for s in plan.steps):
+            return True
+        limit = self.settings.max_steps_without_edit
+        since = 0
+        for o in reversed(state.observations):     # observations since the last successful edit
+            if self._is_edit(o):
+                break
+            since += 1
+        if since < limit:
+            # >=, not ==: one step can dispatch several tool calls, so an exact counter
+            # value can be skipped and the warning never delivered at all.
+            warned = any(EDIT_NUDGE in o.result_summary for o in state.observations[-since:]) if since else True
+            if since >= limit // 2 and not warned:
+                state.observations[-1] = replace(state.observations[-1], result_summary=(
+                    state.observations[-1].result_summary + HARNESS_NOTE + EDIT_NUDGE +
+                    f" ({since} steps so far, and the plan calls for an edit.) Make the change now with "
+                    f"edit_file, write_file, delete_file or apply_patch; read a file first only if you "
+                    f"still need its exact text."))
+            return True
+        return self._stalled(state, step, f"{since} steps without a successful edit",
+                             f"the plan has edit steps but {since} steps passed with no successful edit",
+                             {"no_edit": True, "steps_since_edit": since})
+
+    def _stalled(self, state: RunState, step: int, reason: str, detail: str, details: dict) -> bool:
+        """End a run that has stopped making progress. Always returns False (the loop ends).
+
+        Where it ends depends on whether there is anything to judge. Edits already on disk are
+        real work: they go to verification, which decides on evidence as it would after any
+        completion claim. Only a stall with nothing to show is BLOCKED.
+        """
+        state.no_progress = True
+        if state.modified_files:
+            state.transition(Phase.READY_FOR_VERIFICATION,
+                             f"no further progress ({reason}); verifying the changes already made")
+            return False
+        state.transition(Phase.BLOCKED, f"no progress: {reason}",
+                         Failure("no_progress", f"{detail}, and changed no file",
+                                 {"no_progress": True, "step": step, **details}))
+        return False
 
     def _after_patch(self, state: RunState, step: int, paths) -> None:
         state.record_modified(paths)

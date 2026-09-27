@@ -3,6 +3,7 @@
 import os
 from dataclasses import replace
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +17,8 @@ from harness.verify import CommandStatus, Comparison, EvidenceKind, FailureClass
 
 from tests.orchestration_helpers import (
     BREAK_DOUBLE_PATCH, BUGGY_REPO, ENVIRONMENT_REPO, FIX_DOUBLE_PATCH, FIX_PATCH, LEGACY_TEST, NO_COMMAND_REPO,
-    PASSING_REPO, REPAIR_PATCH, SECOND_WRONG_PATCH, TASK, UNITTEST_CMD, WRONG_PATCH, complete, plan_response, tool,
+    PASSING_REPO, REPAIR_PATCH, SECOND_WRONG_PATCH, SLOW_CMD, SLOW_REPO, TASK, UNITTEST_CMD, WRONG_PATCH,
+    complete, plan_response, tool,
 )
 from tests.repo_fixtures import git_repo
 
@@ -184,6 +186,24 @@ class EnvironmentAndEvidenceTest(VerificationCase):
         self.assertEqual((state.model_calls, state.repair_cycles), (3, 0))    # no repair model call
         self.assertEqual({i.result for i in self.items(EvidenceKind.ENVIRONMENT)}, {"ENVIRONMENT_ERROR"})
 
+    def test_timed_out_baseline_command_is_not_run_again(self):
+        """A test command that timed out at baseline can never show a fail -> pass, and
+        re-running it costs the full timeout every round, so it is dropped after baseline."""
+        state = self.run_task(SLOW_REPO, plan_response(verification_candidates=[SLOW_CMD]),
+                              tool("apply_patch", patch=FIX_PATCH), complete(),
+                              limits=Limits(command_timeout_seconds=1, max_repair_cycles=0))
+        baseline = state.baseline
+        self.assertEqual([r.classification.status for r in baseline.runs], [CommandStatus.TIMEOUT])
+        self.assertEqual([cid for cid, _ in baseline.unusable], ["V1"])
+        self.assertFalse(baseline.usable_test_run)
+        self.assertIn("V1 will not be run again", baseline.render())
+
+        (report,) = state.verification_reports
+        self.assertEqual(report.command_results, ())                  # never re-run
+        self.assertTrue(any("V1 not run" in r and "timed out at baseline" in r for r in report.risks))
+        self.assertNotEqual(state.phase, Phase.VERIFIED)              # no evidence, so no claim
+        self.assertIn("return x + 1", (self.root / "src" / "math_utils.py").read_text())   # edit kept
+
     def test_no_verification_command_is_unverified(self):
         state = self.run_task(NO_COMMAND_REPO, plan_response(), tool("apply_patch", patch=FIX_PATCH), complete())
         self.assertEqual(state.phase, Phase.UNVERIFIED)
@@ -289,3 +309,58 @@ class LimitTest(VerificationCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SetupStepTest(unittest.TestCase):
+    """The engine's install step: it runs before anything is measured, at most once,
+    and a command that still exits 127 gets one retry behind it."""
+
+    def engine(self, setup_argv, commands):
+        import tempfile as _tf
+        from harness.orchestrator.state import RunState
+        from harness.repo.commands import CommandCandidate
+        from harness.tools import ToolContext, build_registry
+        from harness.verify.commands import VerificationCommand
+        from harness.verify.engine import VerificationEngine
+        from harness.verify.ledger import ChangeLedger, EvidenceLedger
+        tmp = _tf.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        state = RunState(task="t", repo_root=str(self.root))
+        state.evidence, state.changes = EvidenceLedger(), ChangeLedger()
+        state.setup_commands = (CommandCandidate("setup", tuple(setup_argv), "high", "test"),) if setup_argv else ()
+        state.verification_commands = tuple(
+            VerificationCommand(f"V{i}", "test", tuple(a), "suite", "discovered", True)
+            for i, a in enumerate(commands, start=1))
+        registry = build_registry(ToolContext.create(self.root))
+        return state, VerificationEngine(registry, state, Limits(), state.evidence, state.changes)
+
+    @staticmethod
+    def py(code):
+        return [sys.executable, "-c", code]
+
+    def test_setup_runs_before_the_commands_and_only_once(self):
+        marker = "open('installed','a').write('x')"
+        state, engine = self.engine(self.py(marker), [self.py("print(open('installed').read())")])
+        engine.baseline()
+        self.assertEqual((self.root / "installed").read_text(), "x")   # ran, and the command saw it
+        engine.verify(1)
+        self.assertEqual((self.root / "installed").read_text(), "x")   # not installed again
+        setup = [i for i in state.evidence.items if i.command_id == "S1"]
+        self.assertEqual(len(setup), 1)
+        self.assertEqual(setup[0].result, "PASS")
+
+    def test_a_command_that_exits_127_installs_and_is_retried(self):
+        """node_modules can exist but be unusable; the first 127 is the only reliable signal."""
+        flaky = self.py("import os,sys; sys.exit(0 if os.path.exists('installed') else 127)")
+        state, engine = self.engine(self.py("open('installed','a').write('x')"), [flaky])
+        baseline = engine.baseline()
+        (run,) = baseline.runs
+        self.assertEqual(run.classification.exit_code, 0)              # the retry, not the 127
+        self.assertTrue((self.root / "installed").exists())
+
+    def test_no_setup_command_means_no_install_and_no_retry(self):
+        state, engine = self.engine(None, [self.py("import sys; sys.exit(127)")])
+        (run,) = engine.baseline().runs
+        self.assertEqual(run.classification.exit_code, 127)            # reported honestly
+        self.assertEqual([i for i in state.evidence.items if i.command_id == "S1"], [])

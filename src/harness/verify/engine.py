@@ -12,7 +12,7 @@ Verdict policy (documented in arch.md §14):
 2. VERIFIED if none of the above, the run changed at least one file, and there is
    STRONG evidence that the task was resolved: a *test* command went fail -> pass,
    or fail -> fewer failures with no new ones; or every acceptance criterion is PASS
-   by a structural check on a file this run created or changed.
+   by a structural check on a file this run created, changed or deleted.
    Test evidence is never strong when the run modified or deleted a pre-existing
    test file, when the post-change run executed fewer tests than the baseline, or
    when the baseline had timed out. Build/lint/typecheck commands only guard against
@@ -33,6 +33,7 @@ baseline to compare with.
 from __future__ import annotations
 
 import enum
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -128,9 +129,16 @@ class BaselineResult:
     initial: RepoSnapshot
     after_baseline: RepoSnapshot
     evidence_id: Optional[str] = None
+    unusable: tuple[tuple[str, str], ...] = ()   # (command id, why) - cannot ever give evidence
 
     def run_for(self, command_id: str) -> Optional[CommandRun]:
         return next((r for r in self.runs if r.command.id == command_id), None)
+
+    @property
+    def usable_test_run(self) -> bool:
+        """Is any test command still able to show a fail -> pass?"""
+        unusable = {cid for cid, _ in self.unusable}
+        return any(r.command.kind == "test" and r.command.id not in unusable for r in self.runs)
 
     def render(self) -> str:
         if not self.available:
@@ -141,6 +149,8 @@ class BaselineResult:
             lines.append(f"- {r.command.id} [{r.command.purpose}] {r.command.text}: {c.status.value} ({c.reason})")
             if c.status != CommandStatus.PASS and c.excerpt:
                 lines.append("  output tail: " + c.excerpt[-600:].replace("\n", "\n  "))
+        for cid, why in self.unusable:
+            lines.append(f"- {cid} will not be run again: {why}")
         return "\n".join(lines)
 
 
@@ -173,6 +183,7 @@ class VerificationEngine:
         self.ledger = ledger
         self.changes = changes
         self.root = Path(state.repo_root)
+        self._setup_ran = False
 
     # tool access ---------------------------------------------------------------
     def _dispatch(self, name: str, arguments: dict):
@@ -207,9 +218,12 @@ class VerificationEngine:
         runs, not_run = [], []
         status: dict[str, CommandStatus] = {}
         commands = self.state.verification_commands
+        unusable = dict(self.state.baseline.unusable) if (escalate and self.state.baseline) else {}
         for command in commands:
             reason = None
-            if not command.within_cap:
+            if command.id in unusable:
+                reason = f"skipped: {unusable[command.id]}"
+            elif not command.within_cap:
                 reason = f"over max_verification_commands ({self.limits.max_verification_commands})"
             elif escalate and command.level == "suite":
                 targets = [c for c in commands if c.parent_id == command.id and c.id in status]
@@ -225,10 +239,34 @@ class VerificationEngine:
             tool = "run_tests" if command.kind == "test" else "run_command"
             result = self._dispatch(tool, {"command": list(command.argv)})
             classification = classify(command.kind, command.argv, result)
+            if classification.exit_code == 127 and self._run_setup(phase):
+                # 127 is "command not found": the project's dependencies are not installed after
+                # all. Install once, then give this command the second chance it deserves.
+                result = self._dispatch(tool, {"command": list(command.argv)})
+                classification = classify(command.kind, command.argv, result)
             item = self.ledger.record_command(phase, command.id, command.kind, command.text, classification)
             runs.append(CommandRun(command, phase, classification, item.id))
             status[command.id] = classification.status
         return tuple(runs), tuple(not_run)
+
+    # setup ----------------------------------------------------------------------
+    def _run_setup(self, phase: str) -> bool:
+        """Install the project's dependencies. Returns True if an install ran just now.
+
+        Runs at most once per run. Without it every script in package.json exits 127 and
+        the whole run is spent on an environment problem rather than on the task.
+        """
+        if self._setup_ran or not self.state.setup_commands:
+            return False
+        self._setup_ran = True
+        for candidate in self.state.setup_commands:
+            text = shlex.join(candidate.argv)
+            result = self._dispatch("run_command", {"command": list(candidate.argv)})
+            classification = classify("setup", candidate.argv, result)
+            self.ledger.record_command(phase, "S1", "setup", text, classification)
+            self.state.emit("setup_completed", command=text, status=classification.status.value,
+                            reason=candidate.reason)
+        return True
 
     # baseline -------------------------------------------------------------------
     def baseline(self) -> BaselineResult:
@@ -236,9 +274,11 @@ class VerificationEngine:
         if not self.state.verification_commands:
             item = self.ledger.record_baseline_unavailable("no verification command was discovered")
             return BaselineResult(False, (), (), initial, initial, item.id)
+        self._run_setup("baseline")            # before anything is measured
         runs, not_run = self._run_commands("baseline")
         after = self.snapshot("after-baseline", with_diff=False) if initial.available else initial
-        return BaselineResult(True, runs, tuple(cid for cid, _ in not_run), initial, after)
+        return BaselineResult(True, runs, tuple(cid for cid, _ in not_run), initial, after,
+                              unusable=_unusable(runs))
 
     # verification ---------------------------------------------------------------
     def verify(self, round_no: int) -> VerificationReport:
@@ -385,7 +425,7 @@ class VerificationEngine:
         """Map criteria to observed test ids by name (a heuristic), in this order:
         a related test that newly fails -> FAIL; a related test that went fail -> pass (only
         from strong command evidence) -> PASS; a related test failing as at baseline -> FAIL;
-        a structural check on a file this run created/changed -> PASS; else UNKNOWN."""
+        a structural check on a file this run created, changed or deleted -> PASS; else UNKNOWN."""
         plan = self.state.plan
         if plan is None:
             return []
@@ -420,8 +460,9 @@ class VerificationEngine:
                 status, notes = "FAIL", (f"related test(s) still fail as before the change: "
                                          f"{', '.join(sorted(old_hits))}")
             elif structural:
-                refs = [i for i in change_items if self.ledger.get(i).path == structural] or []
-                status, notes = "PASS", f"{structural} was created/changed by this run (structural check only)"
+                path, what = structural
+                refs = [i for i in change_items if self.ledger.get(i).path == path] or []
+                status, notes = "PASS", f"{path} was {what} by this run (structural check only)"
             else:
                 refs, status, notes = [], "UNKNOWN", "no observed evidence maps to this criterion"
             item = self.ledger.record_assessment(phase, criterion, status, refs, notes)
@@ -434,19 +475,30 @@ class VerificationEngine:
         terms = [normalize_name(i) for i in signals.identifiers] + list(signals.name_parts)
         return [t for t in dict.fromkeys(terms) if len(t) >= 4]
 
-    def _structural(self, criterion: str, changed=()) -> Optional[str]:
-        """A criterion that asks for a file to exist, naming a file this run created or changed."""
+    def _structural(self, criterion: str, changed=()) -> Optional[tuple[str, str]]:
+        """A criterion about a file's presence, naming a file this run changed.
+
+        Both directions count. A removal task ("delete X") states its goal in the negative,
+        and checking only for existence left every such criterion permanently UNKNOWN.
+        Returns ``(path, what happened)``, or None when the criterion is not structural.
+        """
         text = criterion.lower()
-        if not any(w in text for w in ("exist", "creat", "add", "present")):
+        wants_gone = any(w in text for w in ("delete", "remove", "drop", "no longer", "gone"))
+        wants_present = any(w in text for w in ("exist", "creat", "add", "present"))
+        if not (wants_gone or wants_present):
             return None
+        deleted = {r.path for r in self.changes.records if r.current_sha256 is None}
         for path in extract_task_signals(criterion).explicit_paths:
             if path not in changed:
                 continue
             try:
-                if resolve_in_repo(self.root, path).is_file():
-                    return path
+                present = resolve_in_repo(self.root, path).is_file()
             except ToolFailure:
                 continue
+            if wants_gone and not present and path in deleted:
+                return path, "deleted"
+            if wants_present and present:
+                return path, "created or changed"
         return None
 
     def _changed_outside_patches(self, baseline: Optional[BaselineResult], final: RepoSnapshot) -> tuple[str, ...]:
@@ -494,3 +546,20 @@ class VerificationEngine:
                     + (f" (changed: {', '.join(changed)})" if changed else ""))
         return (Verdict.UNVERIFIED, FailureClass.ENVIRONMENT_ERROR if env else FailureClass.NO_VERIFICATION_EVIDENCE,
                 "no positive evidence: " + ("; ".join(f"{r.command.id} {r.note}" for r in results) or "no command ran"))
+
+
+def _unusable(runs) -> tuple[tuple[str, str], ...]:
+    """Baseline test commands that can never show the task was resolved.
+
+    A test command that timed out at baseline never observed the original failure, so
+    ``_strength_caveat`` permanently downgrades any later pass to weak (see the verdict
+    policy above). Re-running it costs the full command timeout every round and can
+    change nothing, so it is dropped after the baseline.
+
+    Only TIMEOUT qualifies. An environment error is cheap to reproduce and must keep
+    reaching the verdict, where it produces BLOCKED - a far more useful answer than
+    silently having no evidence.
+    """
+    return tuple((r.command.id, "it timed out at baseline, so it can never show a fail -> pass")
+                 for r in runs
+                 if r.command.kind == "test" and r.classification.status == CommandStatus.TIMEOUT)

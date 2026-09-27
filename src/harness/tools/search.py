@@ -150,7 +150,13 @@ def _ripgrep(ctx, query, target, regex, case_sensitive, glob, keep, limit, scope
         try:
             assert proc.stdout is not None
             for raw in proc.stdout:
-                event = json.loads(raw)
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Killing ripgrep (timeout, or the match limit) can cut its last line
+                    # mid-write. The stream is over; report what was collected as partial.
+                    truncated = True
+                    break
                 if event.get("type") != "match":
                     continue
                 data = event["data"]

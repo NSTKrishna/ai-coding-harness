@@ -109,6 +109,11 @@ NO_COMMAND_REPO = {
 # The only discovered command needs a tool that does not exist.
 ENVIRONMENT_REPO = {**NO_COMMAND_REPO, "Makefile": "test:\n\tnonexistent_tool_xyz_123 --run tests\n"}
 
+# A test command that outlives any sane timeout (meshery's `go test ./...` in miniature).
+SLOW_REPO = {**BUGGY_REPO,   # the interpreter path is quoted: a temp dir may contain spaces
+             "Makefile": f'test:\n\t"{_sys.executable}" -c \'import time; time.sleep(30)\'\n'}
+SLOW_CMD = "make test"
+
 LEGACY_TEST = (
     "import unittest\n\n\nclass LegacyTest(unittest.TestCase):\n"
     "    def test_legacy_format(self):\n        self.assertEqual('a-b', 'a_b')   # fails before and after\n"

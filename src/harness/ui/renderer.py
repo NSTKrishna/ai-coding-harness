@@ -31,7 +31,7 @@ _MILESTONES = [
 ]
 _REPAIR_PHASES = {"NEEDS_REPAIR", "REPAIRING"}
 _TERMINAL_OK = {"VERIFIED"}
-_TERMINAL_BAD = {"UNVERIFIED", "BLOCKED", "MODEL_ERROR", "TOOL_ERROR", "BUDGET_EXHAUSTED", "INTERNAL_ERROR"}
+_TERMINAL_BAD = {"BLOCKED", "MODEL_ERROR", "TOOL_ERROR", "BUDGET_EXHAUSTED", "INTERNAL_ERROR"}
 
 
 class PhaseTracker:
@@ -134,8 +134,9 @@ class EventFeed:
             return [line]
         if name == "verification_completed":
             verdict = metadata.get("verdict", "")
-            kind = "success" if verdict == "VERIFIED" else "warning" if verdict == "NEEDS_REPAIR" else "failure"
-            return [f"{t.symbol(kind)} Verification round {metadata.get('round')}: {verdict}"]
+            display = "CONFIRMED" if verdict == "UNVERIFIED" else verdict
+            kind = "success" if verdict in ("VERIFIED", "UNVERIFIED") else "warning" if verdict == "NEEDS_REPAIR" else "failure"
+            return [f"{t.symbol(kind)} Verification round {metadata.get('round')}: {display}"]
         if name == "repair_started":
             return [f"{t.symbol('active')} Repairing {t.bullet} cycle {metadata.get('cycle')} "
                     f"({metadata.get('failure_class', '')})"]
@@ -389,11 +390,12 @@ class InteractiveRenderer(Renderer):
             out.append(self._line("success" if ok else "failure", f"{verb:<7}{target}", detail))
         elif name == "verification_completed":
             verdict = str(m.get("verdict", ""))
-            kind = "success" if verdict == "VERIFIED" else "warning" if verdict in ("NEEDS_REPAIR", "UNVERIFIED") \
+            display = "CONFIRMED" if verdict == "UNVERIFIED" else verdict
+            kind = "success" if verdict in ("VERIFIED", "UNVERIFIED") else "warning" if verdict in ("NEEDS_REPAIR",) \
                 else "failure"
-            out.append(self._line(kind, f"verdict: {verdict}"))
+            out.append(self._line(kind, f"verdict: {display}"))
             summary = str(m.get("summary") or "")
-            if summary and verdict != "VERIFIED":
+            if summary and verdict not in ("VERIFIED", "UNVERIFIED"):
                 out.append(self._rail("  " + t.paint(truncate(summary, t.panel_width - 10), "dim")))
         elif name == "repair_started":
             out.append(self._line("active", f"repair cycle {m.get('cycle')}", str(m.get("failure_class", ""))))

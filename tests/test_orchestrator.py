@@ -189,10 +189,12 @@ class BudgetTest(OrchestratorCase):
         self.assertEqual(self.model.call_count, 0)
 
     def test_execution_requests_stay_bounded(self):
-        # distinct calls: 30 identical calls would (correctly) be stopped by the M6 no-progress rule
+        # distinct calls: 30 identical calls would (correctly) be stopped by the M6 no-progress rule.
+        # The plan is inspect-only, so the stalled-edit rule does not apply either: this test is
+        # about context staying bounded over a long run, not about progress.
         reads = [tool("read_range", path="src/math_utils.py", start_line=1, end_line=n) for n in range(1, 31)]
-        state = self.run_script(plan_response(), *reads, complete(),
-                                limits=Limits(max_steps=40, max_repair_cycles=0))
+        state = self.run_script(plan_response(steps=[{"kind": "inspect", "description": "Read the file"}]),
+                                *reads, complete(), limits=Limits(max_steps=40, max_repair_cycles=0))
         sizes = [len(r.messages[1].content) for r in self.model.requests[1:]]
         self.assertEqual(state.steps, 31)
         self.assertLess(max(sizes[22:]) - min(sizes[22:]), 200)   # windows saturated: no growth
@@ -260,6 +262,66 @@ class MalformedOutputTest(OrchestratorCase):
         self.run_script(plan_response(), read(1), read(2), complete(), limits=Limits(max_steps=6, max_repair_cycles=0))
         self.assertNotIn("Few steps remain", self.model.requests[1].messages[1].content)    # 6 steps left
         self.assertIn("Few steps remain", self.model.requests[2].messages[1].content)       # 5 steps left
+
+    @staticmethod
+    def distinct_reads(count):
+        """`count` read_range calls that each return something different (so no rule but the one
+        under test can fire). src/math_utils.py has 6 lines, tests/test_math_utils.py has 8."""
+        spans = [("src/math_utils.py", a, b) for a in range(1, 6) for b in range(a, 7)]
+        spans += [("tests/test_math_utils.py", a, b) for a in range(1, 8) for b in range(a, 9)]
+        assert count <= len(spans), count
+        return [tool("read_range", path=p, start_line=a, end_line=b) for p, a, b in spans[:count]]
+
+    def test_a_cycle_of_read_only_calls_is_stopped(self):
+        """A,B,C,A,B,C never repeats consecutively, so only the window rule can see it."""
+        cycle = [tool("read_file", path="src/math_utils.py"),
+                 tool("git_status"),
+                 tool("list_files", path="src")] * 4
+        state = self.run_script(plan_response(), *cycle, complete(), limits=Limits(max_repair_cycles=0))
+        self.assert_terminal(state, Phase.BLOCKED, "no_progress")
+        self.assertTrue(state.no_progress)
+        self.assertTrue(state.failure.details.get("cycle"))
+        self.assertIn("repeated earlier calls", state.terminal_reason)
+        self.assertEqual(state.steps, 11)            # 3 new calls, then a full window of repeats
+        self.assertEqual(state.modified_files, [])
+
+    def test_varied_exploration_is_not_mistaken_for_a_cycle(self):
+        """One genuinely new observation per window is enough: a wide search is real work."""
+        state = self.run_script(plan_response(), *self.distinct_reads(15),
+                                tool("apply_patch", patch=FIX_PATCH), complete(), limits=NO_REPAIR)
+        self.assertEqual(state.phase, Phase.VERIFIED, state.terminal_reason)
+
+    def test_a_plan_with_edit_steps_that_never_edits_is_stopped(self):
+        state = self.run_script(plan_response(), *self.distinct_reads(30), complete(),
+                                limits=Limits(max_steps=40, max_repair_cycles=0))
+        self.assert_terminal(state, Phase.BLOCKED, "no_progress")
+        self.assertTrue(state.failure.details.get("no_edit"))
+        self.assertEqual(state.steps, 20)            # the allowance, not the 40-step budget
+        warned = [i for i, r in enumerate(self.model.requests) if "No successful edit yet." in r.messages[1].content]
+        self.assertTrue(warned, "the model should be warned before being stopped")
+        self.assertLess(warned[0], state.steps, "the warning must arrive before the stop, not with it")
+
+    def test_a_stall_after_real_edits_is_verified_not_discarded(self):
+        """Edits already on disk are real work. Stopping the loop must not throw away the
+        chance to judge them: a live run deleted the right files, then flailed, and was BLOCKED."""
+        state = self.run_script(plan_response(), tool("apply_patch", patch=FIX_PATCH),
+                                *([tool("git_status"), tool("list_files", path="src")] * 6),
+                                limits=NO_REPAIR)
+        self.assertTrue(state.no_progress)
+        self.assertIsNone(state.failure)                       # a stall, not a failure
+        self.assertEqual(state.phase, Phase.VERIFIED, state.terminal_reason)   # judged on evidence
+        self.assertEqual(state.modified_files, ["src/math_utils.py"])
+        self.assertTrue(any("verifying the changes already made" in t.reason
+                            for t in state.transitions if t.target == Phase.READY_FOR_VERIFICATION))
+
+    def test_the_stalled_edit_rule_ignores_an_inspect_only_plan(self):
+        """Nothing was asked to change, so making no change is not a stall."""
+        state = self.run_script(plan_response(steps=[{"kind": "inspect", "description": "Look"}]),
+                                *self.distinct_reads(25), complete(),
+                                limits=Limits(max_steps=40, max_repair_cycles=0))
+        self.assertEqual(state.steps, 26)                 # every step ran; nothing was cut short
+        self.assertNotEqual(state.failure.kind, "no_progress")
+        self.assertFalse(state.no_progress)
 
     def test_invalid_reply_is_fed_back_and_the_run_recovers(self):
         state = self.run_script(plan_response(), text_response("I will now fix the bug."),

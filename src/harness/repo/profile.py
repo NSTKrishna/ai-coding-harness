@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from harness.repo.classify import CODE_LANGUAGES
-from harness.repo.commands import CommandCandidate, discover_commands
+from harness.repo.commands import CommandCandidate, discover_commands, discover_setup_commands
 from harness.repo.facts import ProjectFacts, gather_facts, package_dependencies, package_manager, pyproject_has, pytest_config
 from harness.repo.inventory import Inventory, build_inventory
 from harness.repo.reader import RepoReader
@@ -49,6 +49,7 @@ class RepoProfile:
     test_roots: tuple[str, ...]
     test_commands: tuple[CommandCandidate, ...]
     build_commands: tuple[CommandCandidate, ...]   # build, lint, typecheck, format
+    setup_commands: tuple[CommandCandidate, ...] = ()   # installs needed before anything can run
     warnings: tuple[str, ...] = ()
 
     def summary(self) -> str:
@@ -67,6 +68,8 @@ class RepoProfile:
             "CI: " + (", ".join(self.ci) or "none"),
             "Test commands: " + ("; ".join(" ".join(c.argv) for c in self.test_commands) or "none identified"),
         ]
+        if self.setup_commands:
+            lines.append("Setup needed first: " + "; ".join(" ".join(c.argv) for c in self.setup_commands))
         return "\n".join(lines)
 
 
@@ -192,6 +195,7 @@ class RepositoryAnalyzer:
             test_roots=tuple(_roots(inventory, "test")),
             test_commands=tuple(tests),
             build_commands=tuple(builds),
+            setup_commands=tuple(discover_setup_commands(facts)),
             warnings=inventory.warnings,
         )
 

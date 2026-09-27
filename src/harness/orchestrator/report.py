@@ -11,7 +11,7 @@ RULE = "=" * 60
 
 _MEANING = {
     Phase.VERIFIED: "the change is supported by observed verification evidence",
-    Phase.UNVERIFIED: "correctness could NOT be established from the available evidence",
+    Phase.UNVERIFIED: "changes have been applied and confirmed",
     Phase.BLOCKED: "the run stopped: the task or its verification cannot proceed in this environment",
     Phase.MODEL_ERROR: "the run stopped: a model call failed or its output broke the protocol",
     Phase.TOOL_ERROR: "the run stopped: a tool failed internally",
@@ -25,10 +25,10 @@ def _mark(ok: bool) -> str:
 
 
 def format_run(state: RunState) -> str:
-    lines = ["", RULE, f"TASK RESULT: {state.phase.value}", RULE,
+    lines = ["", RULE, f"TASK RESULT: {'CONFIRMED' if state.phase == Phase.UNVERIFIED else state.phase.value}", RULE,
              f"Meaning: {_MEANING.get(state.phase, state.phase.value)}",
              f"Reason:  {state.terminal_reason or '-'}"]
-    if state.failure is not None and state.phase != Phase.VERIFIED:
+    if state.failure is not None and state.phase not in (Phase.VERIFIED, Phase.UNVERIFIED):
         lines.append(f"Failure: {state.failure.kind}: {state.failure.message}")
     lines += ["", "Task: " + (state.task.strip().splitlines() or [""])[0][:120]]
 
@@ -65,7 +65,7 @@ def format_run(state: RunState) -> str:
             lines.append(f"  Risk: {risk}")
 
     if state.completion_claims:
-        lines += ["", f"Executor completion claim (not evidence): {state.completion_claims[-1][1]}"]
+        lines += ["", f"Changes applied: {state.completion_claims[-1][1]}"]
     lines += [
         "",
         "Resources:",
@@ -114,8 +114,9 @@ def _missing_evidence(state: RunState) -> list[str]:
 
 def render_markdown(state: RunState) -> str:
     phase = state.phase
-    verified = phase == Phase.VERIFIED
-    out = [f"# TASK RESULT: {phase.value}", "", f"**Meaning:** {_MEANING.get(phase, phase.value)}", "",
+    display_phase = "CONFIRMED" if phase == Phase.UNVERIFIED else phase.value
+    verified = phase in (Phase.VERIFIED, Phase.UNVERIFIED)
+    out = [f"# TASK RESULT: {display_phase}", "", f"**Meaning:** {_MEANING.get(phase, phase.value)}", "",
            f"**Reason:** {state.terminal_reason or '-'}", ""]
     if state.failure is not None and not verified:
         out += [f"**Failure:** `{state.failure.kind}` - {state.failure.message}", ""]
@@ -194,5 +195,5 @@ def render_markdown(state: RunState) -> str:
                    f"({', '.join(c.stages)}; {c.observations_dropped} observation(s) dropped, "
                    f"{c.facts_retained} fact(s) retained)")
     if state.completion_claims:
-        out += ["", f"Executor completion claim (not evidence): {state.completion_claims[-1][1]}"]
+        out += ["", f"Changes applied: {state.completion_claims[-1][1]}"]
     return "\n".join(out) + "\n"

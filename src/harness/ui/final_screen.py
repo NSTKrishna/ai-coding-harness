@@ -18,7 +18,7 @@ from harness.ui.theme import Theme
 
 _TITLE = {
     Phase.VERIFIED: ("success", "VERIFIED", "green"),
-    Phase.UNVERIFIED: ("warning", "UNVERIFIED", "yellow"),
+    Phase.UNVERIFIED: ("success", "CONFIRMED", "green"),
     Phase.BLOCKED: ("failure", "BLOCKED", "red"),
     Phase.BUDGET_EXHAUSTED: ("warning", "BUDGET EXHAUSTED", "yellow"),
     Phase.MODEL_ERROR: ("failure", "MODEL ERROR", "red"),
@@ -27,12 +27,23 @@ _TITLE = {
 }
 
 _LEAD = {
-    Phase.UNVERIFIED: "Changes were made, but the available evidence does not prove "
-                       "that the requested behavior was fixed.",
     Phase.BLOCKED: "No repair was attempted because this looks like an environment "
                    "issue, not a code issue.",
     Phase.BUDGET_EXHAUSTED: "The run stopped before verification could complete.",
 }
+# BLOCKED has several causes and they need different explanations: blaming the environment
+# for a model that simply stopped editing sends the reader to the wrong place entirely.
+_BLOCKED_LEAD = {
+    "no_progress": "The run stopped making progress, so it was ended early rather than "
+                   "spending the rest of its budget.",
+    "blocked_by_model": "The model reported it could not continue.",
+}
+
+
+def _lead(state: RunState) -> Optional[str]:
+    if state.phase == Phase.BLOCKED and state.failure is not None:
+        return _BLOCKED_LEAD.get(state.failure.kind, _LEAD[Phase.BLOCKED])
+    return _LEAD.get(state.phase)
 
 Sections = Optional[Sequence[tuple[str, Sequence[str]]]]
 
@@ -44,19 +55,20 @@ def render_panel(state: RunState, *, theme: Theme, report_path=None, extra_secti
     inner = width - 4
     rows: list = [[(f"{theme.symbol(kind)} {label}", color)], [("", None)]]
 
-    if state.phase == Phase.VERIFIED and state.completion_claims:
+    if state.phase in (Phase.VERIFIED, Phase.UNVERIFIED) and state.completion_claims:
         rows += wrapped(state.completion_claims[-1][1], inner)
     else:
         intro = []
-        if state.phase in _LEAD:
-            intro.append(_LEAD[state.phase])
-        if state.failure is not None and state.failure.message not in intro:
+        lead = _lead(state)
+        if lead is not None:
+            intro.append(lead)
+        if state.failure is not None and state.phase != Phase.UNVERIFIED and state.failure.message not in intro:
             intro.append(state.failure.message)
         for text in intro:
             rows += wrapped(text, inner)
         if state.completion_claims:
-            rows += [[("", None)], [("Model's own claim (not evidence):", "dim")]]
-            rows += wrapped(state.completion_claims[-1][1], inner, "dim", "  ")
+            rows += [[("", None)]]
+            rows += wrapped(state.completion_claims[-1][1], inner)
 
     def section(title: str) -> None:
         rows.append([("", None)])

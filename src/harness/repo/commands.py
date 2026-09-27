@@ -56,13 +56,48 @@ def discover_commands(inventory: Inventory, facts: ProjectFacts) -> tuple[list[C
     return _test_commands(inventory, facts), _build_commands(facts)
 
 
+# Lockfile -> the install that reproduces it exactly, most specific first.
+NODE_INSTALLS = (
+    ("pnpm-lock.yaml", ("pnpm", "install", "--frozen-lockfile")),
+    ("yarn.lock", ("yarn", "install", "--frozen-lockfile")),
+    ("package-lock.json", ("npm", "ci")),
+)
+
+
+def discover_setup_commands(facts: ProjectFacts) -> list[CommandCandidate]:
+    """Installs the repository needs before any of its own commands can run.
+
+    Only when something is demonstrably missing: an install is slow and needs the network,
+    so a repository that is already prepared is left alone. Without this, every script in
+    package.json exits 127 and the whole run is wasted on an environment problem.
+    """
+    if "package.json" not in facts.root_files or facts.node_modules_present:
+        return []
+    for lockfile, argv in NODE_INSTALLS:
+        if lockfile in facts.root_files:
+            return [CommandCandidate("setup", argv, "high", f"{lockfile} present and node_modules/ is missing")]
+    return [CommandCandidate("setup", ("npm", "install"), "medium",
+                             "package.json present (no lockfile) and node_modules/ is missing")]
+
+
 def _test_commands(inventory: Inventory, facts: ProjectFacts) -> list[CommandCandidate]:
     rf = facts.root_files
     py = facts.python_interpreter
     found: list[CommandCandidate] = []
 
+    seen: set[tuple[str, ...]] = set()
+
     def add(argv, confidence, reason):
-        found.append(CommandCandidate("test", tuple(argv), confidence, reason))
+        argv = tuple(argv)
+        if argv in seen:
+            return
+        seen.add(argv)
+        found.append(CommandCandidate("test", argv, confidence, reason))
+
+    # What the project's own CI runs beats any template: it is the command the
+    # maintainers keep green, already scoped and flagged for an unattended run.
+    for argv, source in facts.ci_test_commands:
+        add(argv, "high", f"{source} runs this")
 
     configured = pytest_config(facts)
     if configured:
@@ -75,7 +110,9 @@ def _test_commands(inventory: Inventory, facts: ProjectFacts) -> list[CommandCan
         add([manager, "test"], "high", f"package.json scripts.test = {test_script!r}")
 
     if "go.mod" in rf and any(p.endswith("_test.go") for p in facts.all_paths):
-        add(["go", "test", "./..."], "high", "go.mod present and *_test.go files exist")
+        # -short is the Go convention for "skip long-running tests"; without it a
+        # single un-tagged integration test can outlast the whole command timeout.
+        add(["go", "test", "-short", "./..."], "high", "go.mod present and *_test.go files exist")
 
     if "Cargo.toml" in rf:
         add(["cargo", "test"], "high", "Cargo.toml present")

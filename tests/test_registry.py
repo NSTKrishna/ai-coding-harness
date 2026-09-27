@@ -121,6 +121,7 @@ class BuiltinRegistryTest(RepoTestCase):
         registry = build_registry(ToolContext.create(self.repo))
         self.assertEqual(set(registry.names), {
             "list_files", "find_files", "read_file", "read_range", "search_text", "apply_patch", "edit_file", "write_file",
+            "delete_file",
             "run_command", "run_tests", "git_status", "git_diff", "git_diff_stat",
         })
         for tool in ALL_TOOLS:

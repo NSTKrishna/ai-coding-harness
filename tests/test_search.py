@@ -1,5 +1,6 @@
 import os
 import shutil
+import io
 import unittest
 from unittest import mock
 
@@ -82,6 +83,28 @@ class SearchTest(RepoTestCase):
             with self.subTest(engine=engine):
                 paths = {m.path for m in self.run_search(engine, "parse_date").matches}
                 self.assertFalse(any(p.startswith("linked") for p in paths))
+
+    def test_a_ripgrep_stream_cut_mid_line_is_partial_not_a_crash(self):
+        """Killing ripgrep (timeout, or the match limit) can cut its last line mid-write.
+        A large repository hit this as an uncaught JSONDecodeError that ended the whole run."""
+        import json as _json
+        import subprocess as _subprocess
+        from unittest import mock
+
+        good = _json.dumps({"type": "match", "data": {
+            "path": {"text": "src/app.py"}, "lines": {"text": "def parse_date(s):"}, "line_number": 1}})
+        stream = io.BytesIO((good + "\n" + good[:40]).encode())        # second line truncated
+
+        class FakeProc:
+            stdout = stream
+            returncode = -9
+            def kill(self): pass
+            def wait(self): return -9
+
+        with mock.patch.object(_subprocess, "Popen", return_value=FakeProc()):
+            result = self.run_search("ripgrep", "parse_date")
+        self.assertEqual([(m.path, m.line) for m in result.matches], [("src/app.py", 1)])
+        self.assertTrue(result.truncated)                              # reported, not silently complete
 
     @unittest.skipUnless(HAS_RG, "ripgrep not installed")
     def test_regex_unsupported_by_ripgrep_falls_back_to_python(self):

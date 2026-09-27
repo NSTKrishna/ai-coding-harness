@@ -134,6 +134,7 @@ class Orchestrator:
             state.targeting = derive_targets(ctx, discovery, state.plan, base_commands)
             return state.targeting
 
+        state.setup_commands = discovery.repo_profile.setup_commands
         state.verification_commands = select_verification_commands(
             state.plan, discovery.repo_profile, ctx.root, self.limits.max_verification_commands,
             derive_targets=targets if self.limits.targeted_tests else None)

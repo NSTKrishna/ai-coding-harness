@@ -290,3 +290,30 @@ class FinalScreenTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BlockedWordingTest(unittest.TestCase):
+    """BLOCKED has several causes; the panel must not explain all of them as environment trouble.
+
+    A live run stalled with a green baseline and was still told it "looks like an environment
+    issue", sending the reader to the wrong place entirely.
+    """
+
+    def panel(self, kind, message):
+        from harness.orchestrator.state import Failure, Phase, RunState
+        from harness.ui.final_screen import render_panel
+        from harness.ui.theme import Theme
+        state = RunState(task="t", repo_root="/tmp")
+        state.phase, state.failure = Phase.BLOCKED, Failure(kind, message)
+        return render_panel(state, theme=Theme(color=False))
+
+    def test_a_stalled_run_is_not_called_an_environment_issue(self):
+        text = self.panel("no_progress", "the plan has edit steps but 20 steps passed with no successful edit")
+        self.assertIn("stopped making progress", text)
+        self.assertNotIn("environment", text)
+
+    def test_a_real_environment_failure_still_says_so(self):
+        self.assertIn("environment", self.panel("environment_error", "npm run build: command not found"))
+
+    def test_the_model_giving_up_is_attributed_to_the_model(self):
+        self.assertIn("model reported", self.panel("blocked_by_model", "I cannot find the file"))

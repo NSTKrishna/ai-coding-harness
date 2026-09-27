@@ -16,6 +16,17 @@ Status:
 - [x] Modify implementation
 - [x] Verify modifications
 
+Evidence (live, 2026-09-27, meshery 75,226 files):
+- Large-repository hardening after a BUDGET_EXHAUSTED run on meshery#21985 (PROGRESS.md
+  "Large-repository hardening"): verification commands are taken from the project's own CI
+  (`.github/workflows`) instead of a hardcoded template, a baseline command that timed out is not
+  re-run, a run that loops or stops producing edits is stopped early, and `delete_file` plus
+  structural removal checks make a deletion task possible and provable.
+  Tests: tests/test_command_discovery.py (CI parsing incl. refusing relocated steps),
+  tests/test_orchestrator.py (cycle and stalled-edit rules, and the healthy runs they must not stop),
+  tests/test_edit_tools.py (delete_file, structural removal, tampering still caught),
+  tests/test_verification.py (timed-out baseline dropped), tests/test_search.py (truncated rg stream).
+
 Evidence (live, 2026-09-26):
 - 8 models (Qwen3-Coder-480B/-Next/-30B, Qwen3-235B-2507, Qwen3-Next-80B, Qwen3-32B, DeepSeek V3.2/V3.1)
   on AWS Bedrock's OpenAI-compatible endpoint, 3 tasks each, through `harness run`: 21/24 VERIFIED.
@@ -176,6 +187,13 @@ Evidence (M3, 2026-09-26):
 - [x] Execute command
 - [x] Run tests
 - [x] Inspect git diff
+
+Evidence (2026-09-27): 14 tools. Editing is served by four write-category tools that all return a
+`PatchResult` and pass through the same change ledger and test-tampering checks: `apply_patch`
+(unified diff), `edit_file` (exact replacement), `write_file` (create/rewrite) and `delete_file`
+(remove one file, text or binary). `delete_file` exists because a deletion through `apply_patch`
+requires restating the file's entire content as removed lines, which a model cannot do without
+first reading it (tests/test_edit_tools.py, tests/test_registry.py).
 
 Evidence (M4, 2026-09-26): all tools are now driven by the executor through
 `ToolRegistry.dispatch_call` in end-to-end ScriptedModel runs. Run tests: discovered test

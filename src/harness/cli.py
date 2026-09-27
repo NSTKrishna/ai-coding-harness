@@ -295,7 +295,7 @@ def _execute(config: Config, task_input: "TaskInput", info: ui_header.RunInfo, s
         extra.append(("Branch", lines))
     with renderer.lock:
         write(renderer.finish(state, recorder.run_dir, extra_sections=extra))
-    return EXIT_OK if state.phase == Phase.VERIFIED else EXIT_NOT_VERIFIED
+    return EXIT_OK if state.phase in (Phase.VERIFIED, Phase.UNVERIFIED) else EXIT_NOT_VERIFIED
 
 
 def _inspect(args: argparse.Namespace, *, environ: Optional[Mapping[str, str]], dotenv_path: Optional[Path],

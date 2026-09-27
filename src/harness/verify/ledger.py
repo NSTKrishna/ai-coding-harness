@@ -27,6 +27,7 @@ class EvidenceKind(str, enum.Enum):
 
 
 KIND_BY_COMMAND = {"test": EvidenceKind.TEST, "build": EvidenceKind.BUILD, "lint": EvidenceKind.LINT,
+                   "setup": EvidenceKind.ENVIRONMENT,
                    "format": EvidenceKind.LINT, "typecheck": EvidenceKind.TYPECHECK}
 
 

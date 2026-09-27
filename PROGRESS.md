@@ -126,6 +126,33 @@ qwen3-coder-30b 1/3 (B: step budget; C: raw newline in text JSON, fixed afterwar
 Every VERIFIED result also passes independently; every failure also fails independently (no false
 success); no run modified, deleted or added a test file; 618 artifact files scanned: no key or key fragment.
 
+## Large-repository hardening - 2026-09-27 (meshery)
+
+A live run against [meshery](https://github.com/meshery/meshery) (75,226 files, Go + Hugo docs) on issue
+#21985 ended BUDGET_EXHAUSTED: 40 steps, 11m51s, 507,975 input tokens, **no file changed**. The diagnosis
+separated one property of that repository from four harness defects.
+
+*Meshery's own property.* `go test ./...` cannot finish: `TestSystemCmdIntegration`
+(`mesheryctl/internal/cli/root/system/system_test.go`) is guarded only by `testing.Short()` and sleeps
+6 x 1 minute against Docker and Kubernetes. Meshery's CI never runs the bare form - it runs
+`go test --short ./server/...`. No timeout value fixes this; the command was simply the wrong one.
+
+*Defects fixed.*
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `repo/commands.py` hardcoded `go test ./...` at high confidence and never read the project's CI | `.github/workflows/*.yml` is parsed for the test command the maintainers keep green; steps that relocate (`cd`, `working-directory:`) or interpolate (`${{ }}`) are refused, CI-only flags (`-json`, `-race`, `-coverprofile`) are dropped. The Go fallback is now `go test -short ./...` |
+| 2 | A baseline TIMEOUT was recorded and ignored, then paid for again every verification round, although `_strength_caveat` had already made it permanently weak | A test command that timed out at baseline is dropped after it, and the prompt says so. Environment errors deliberately still run, because they must reach the verdict as BLOCKED |
+| 3 | The no-progress rule counted only *consecutive* identical calls, so an A,B,C,A,B,C cycle ran to the step budget; nothing watched edit productivity | A window rule stops a run whose last 8 observations all repeat earlier calls and changed nothing (one new observation is enough to continue), and a plan with edit steps that makes none for 20 steps is warned at 10 and stopped at 20 |
+| 4 | Deletion was impossible and unverifiable: no delete tool, and `_structural` matched only "exist/creat/add/present" **and** required `is_file()` | `delete_file` (text or binary, same ledger and tamper checks as the other editing tools); `_structural` now proves removals too |
+
+Also fixed while verifying: ripgrep's `--json` stream is parsed per line, and killing it (timeout or match
+cap) cuts the last line mid-write - an uncaught `JSONDecodeError` that ended the whole run on a repository
+this size (`tools/search.py`).
+
+*Result on the same task.* Baseline `go test --short ./server/...` finishes in **58.5s, exit 0** (was a 300s
+timeout). The model deletes both files with `delete_file`.
+
 ## What still prevents real evaluator execution
 
 1. **Evaluator endpoint unknown.** The `openai_compatible` adapter works live (above), but the
@@ -212,6 +239,11 @@ tracked + untracked files found no matches; no `git reset|checkout|clean` in `sr
   tools) alone exceeds the threshold, the record says `reached_limit: false`.
 - **Artifact generation is outside the run's budgets** (e.g. the final git diff).
 - **Guardrails, not a sandbox** (M2): the command policy cannot see inside `python -c`, `make` or test code.
+- **A CI-derived command carries no working directory.** `CommandCandidate` is an argv with no cwd, so a CI
+  step that runs elsewhere is refused rather than adopted and run at the repository root. Repositories whose
+  only test command is `cd sub && ...` fall back to the language template.
+- **CI parsing is line-based** (no YAML parser, consistent with the rest of `facts.py`): the first 20
+  workflows are read, test-named ones first.
 
 ## Important architectural decisions
 
